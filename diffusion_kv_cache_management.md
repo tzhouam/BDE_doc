@@ -200,8 +200,12 @@ the memory-management authority.
 interactive streaming diffusion system for real-time video-to-video generation.
 It is less directly aligned with vLLM serving than FlashDreams, but it contains
 two useful implementation references for BDE: a **ring-buffer KV cache** for
-sliding-window causal video attention, and a **pipeline-parallel KV rebalance**
-path for multi-GPU streaming.
+sliding-window causal video attention, and a distributed KV-owner rebalance path
+for multi-GPU streaming. The latter is **not** a v1 requirement for BDE: vLLM's
+existing static pipeline parallelism already keeps each rank's layer-local KV in
+place and passes activations between ranks. Rebalance only becomes relevant if a
+future world-model runtime allows KV block ownership itself to change across
+ranks or nodes.
 
 The single-GPU path exposes a staged loop:
 
@@ -249,12 +253,15 @@ Two additional ideas are useful but should remain out of the BDE v1 main path:
   refreshes low-similarity sink positions. This is promising for long-running
   sessions, but complicates vLLM prefix sharing and refcounts, so BDE should
   keep fixed sinks in v1 and list adaptive sinks as future work.
-- **Pipeline-parallel KV rebalance.** Its distributed
+- **Dynamic KV-owner rebalance.** Its distributed
   `KVCacheManager.compute_block_owners()` /
   `rebalance_kv_cache_by_diff()` / `broadcast_kv_blocks()` path tracks block
   interval ownership across ranks and broadcasts moved KV blocks from old owner
-  to new owner. This is not a replacement for vLLM's KV connector, but it is a
-  concrete prior-art pattern for Phase 4 cross-rank / cross-node KV movement.
+  to new owner. This should not be confused with normal vLLM PP, where layer
+  ownership is static and historical KV stays on the rank that owns the layer.
+  For BDE, this is only prior art for a future mode with dynamic rank ownership
+  or cross-node KV movement; the default should rely on vLLM's PP/KV-connector
+  abstractions rather than copying this mechanism.
 
 As with FlashDreams, StreamDiffusionV2 should be treated as a **semantic and
 systems-pattern reference**, not copied as the allocator. BDE still delegates
@@ -352,8 +359,14 @@ keep in sync with vLLM forever.
 - **DiT**: Diffusion Transformer (denoiser run N times over the latent).
 - **AR/hybrid model**: a model whose denoiser is a causal/GPT-style transformer
   that maintains attention KV (e.g. HunyuanImage3).
-- **Chunk**: a unit of autoregressive generation in a world-model (a frame, a
-  group of latent tokens). `chunk_size` tokens per chunk.
+- **Chunk**: the KV-accounting unit for autoregressive generation in a
+  world-model: the set of persistent self-attention tokens materialized when the
+  model advances by one causal attention block. `chunk_size` tokens per chunk.
+  For DreamZero, this maps to `num_frame_per_block * frame_seqlen`, not to one
+  OpenPI serving request or the outer 4-frame observation bundle
+  (`FRAMES_PER_CHUNK`). The first-frame prefill is a special prefix of
+  `frame_seqlen` tokens, and action/state registers are per-forward tokens that
+  participate in attention but are not part of the persistent self-attention KV.
 - **Chunk window**: the last `W` chunks whose KV is kept resident
   (`sliding_window = W * chunk_size`).
 - **Blockwise-causal attention** (#1987 term): a chunk attends causally to all
@@ -563,14 +576,26 @@ chunk count is equivalent and avoids `null_block` index drift.)
 (`DiffusionSchedulerOutput.scheduled_request_ids`) with no per-request token
 count. We add the minimal accounting:
 
-- On admit / each new chunk, the scheduler computes `num_new_tokens =
-  chunk_size` (the tokens the about-to-run chunk will materialize) and the
-  adapter's `num_computed_tokens` reflects already-committed chunks.
-- Admission gate: before running a step, call `allocate_slots(adapter,
-  num_new_tokens=chunk_size, full_sequence_must_fit=...)`. A `None` return means
-  "not enough free blocks" → defer/preempt, mirroring vLLM's scheduler.
+- `num_new_tokens` means "how many persistent KV tokens this admission will
+  materialize", not "how many text tokens were decoded". For chunked world
+  models, the normal value is `chunk_size`.
+- DreamZero-specific mapping: for a regular causal attention block,
+  `num_new_tokens = chunk_size = num_frame_per_block * frame_seqlen`. The
+  first-frame prefill is a special prefix with `num_new_tokens = frame_seqlen`.
+  Action/state registers are per-forward tokens and are not counted in
+  `num_new_tokens` because they are not appended to persistent self-attention KV.
+- On admit / each new chunk, the adapter's `num_computed_tokens` reflects
+  already-committed persistent KV (`completed_chunks * chunk_size`, plus any
+  model-specific prefill prefix). The scheduler calls `allocate_slots(adapter,
+  num_new_tokens=..., full_sequence_must_fit=...)` before the request enters the
+  running batch. A `None` return means "not enough free blocks" → defer/preempt,
+  mirroring vLLM's scheduler.
+- For `T > 1` denoise, only the first step for a chunk allocates slots. Steps
+  `1..T-1` use `num_new_tokens = 0` and reuse the same `slot_mapping`; the
+  adapter advances `num_computed_tokens` only once, when the chunk is committed.
 - This is bookkeeping only; it does not change diffusion's fixed step-count
-  execution model.
+  execution model. It moves KV-capacity failure to scheduler admission instead
+  of discovering OOM inside the model forward.
 
 ### Component 4: Runner BlockTables + slot_mapping
 
@@ -756,9 +781,10 @@ Pure DiT models (Flux, Qwen-Image, Wan, Z-Image, Hunyuan-Video, LTX2, …) are
   Flip `skip_reading_prefix_cache` off; compute conditioning `block_hashes`;
   reuse vLLM's prefix index + `ref_cnt`. Migrate SenseNova-U1 / Bagel / NextStep.
 - **Phase 4 (optional) — CPU spill + cross-node KV** via vLLM's KV connector and
-  the Omni connector layer. StreamDiffusionV2's block-owner rebalance can be
-  used as prior art for the rank-ownership protocol, but the transport should
-  still converge on vLLM connector abstractions.
+  the Omni connector layer. Static PP should continue to use vLLM's existing
+  rank-local KV ownership. StreamDiffusionV2's block-owner rebalance is only
+  prior art if BDE later needs dynamic rank ownership or cross-node KV movement;
+  the transport should still converge on vLLM connector abstractions.
 
 Each phase is independently shippable behind the disabled-by-default flag.
 
@@ -796,7 +822,7 @@ explicit dependencies and handoff interfaces so it can be parallelized.
 | **WP-6** | **DreamZero** migration + parity gate (sliding-replace / window-reset) | 2 | WP-2, WP-4, WP-5; **C** (#2162) | parity vs cache-off; window config | **C** (DreamZero owner) |
 | **WP-7** | Multiturn session KV lifetime ([Open Q6](#open-questions)): session-scoped default, reset/preempt semantics for open streams | 2–3 | WP-1; **B**, **D** (#3673) | session→adapter lifetime, `free()` on close/abort | **B** + **D** |
 | **WP-8** | Cross-request prefix reuse + CFG sharing | 3 | WP-1, WP-2; **A** (CFG branch identity) | `block_hashes` + `PrefixKey(CFG branch)` | **F** + **A** |
-| **WP-9** | Optional cross-rank / cross-node KV movement (Phase 4) | 4 | vLLM KV connector; StreamDiffusionV2 owner-rebalance prior art | block owner map → connector transfer | **F** + vLLM core |
+| **WP-9** | Optional dynamic cross-rank / cross-node KV movement (Phase 4; not needed for static vLLM PP) | 4 | vLLM PP/KV connector; StreamDiffusionV2 owner-rebalance prior art | optional block owner map → connector transfer | **F** + vLLM core |
 
 ### Coordination / handoff points to agree before coding
 
@@ -809,6 +835,9 @@ explicit dependencies and handoff interfaces so it can be parallelized.
    define the session-scoped `free()` / reset / preempt semantics (WP-7).
 3. **With C (DreamZero):** first real consumer + parity target; picks
    sliding-replace vs window-reset, `chunk_size`, `window_chunks`, `sink_chunks`.
+   For DreamZero specifically, confirm the mapping
+   `chunk_size = num_frame_per_block * frame_seqlen`, the first-frame prefill
+   prefix, and that action/state registers stay outside persistent KV.
 4. **With D (realtime API):** the multiturn loop decides when chunks are admitted
    / committed and when an aborted stream releases KV.
 5. **With vLLM core:** registering a new `SlidingWindowSpec` subclass in
@@ -930,10 +959,12 @@ explicit dependencies and handoff interfaces so it can be parallelized.
    when new K/V becomes dissimilar to old sink K/V. Should BDE support this for
    long-running sessions? Proposal: not in v1, because sink mutation interacts
    with prefix sharing and `BlockPool` refcounts.
-8. **Pipeline-parallel KV rebalance.** StreamDiffusionV2 broadcasts moved KV
-   blocks when layer/block ownership changes across ranks. Should BDE expose a
-   similar logical owner map for future pipeline-parallel world-model serving,
-   or rely entirely on vLLM's existing KV connector abstractions?
+8. **Dynamic KV-owner rebalance.** vLLM's static PP already handles the common
+   case: each rank owns a fixed layer shard, keeps that shard's KV local, and
+   passes activations between ranks. StreamDiffusionV2 broadcasts moved KV blocks
+   only when layer/block ownership changes across ranks. Should BDE ever expose
+   a logical owner map for such dynamic ownership, or rely entirely on vLLM's
+   existing PP and KV connector abstractions?
 
 ---
 
