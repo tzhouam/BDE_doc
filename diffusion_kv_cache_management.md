@@ -25,6 +25,7 @@
 
 - [Motivation](#motivation)
 - [Background: What Exists Today](#background-what-exists-today)
+- [Prior Art: FlashDreams](#prior-art-flashdreams)
 - [Core Decision](#core-decision)
 - [Goals and Non-Goals](#goals-and-non-goals)
 - [Terminology](#terminology)
@@ -134,6 +135,155 @@ paged KV stack we want to reuse rather than reimplement:
   any `SlidingWindowSpec` subclass to `KVCacheSpecKind.SLIDING_WINDOW`.
 - `vllm/v1/worker/gpu/block_table.py` — `BlockTables`, which turns block ids into
   the per-token `slot_mapping` consumed by paged attention kernels.
+
+## Prior Art: FlashDreams
+
+[NVIDIA FlashDreams](https://github.com/NVIDIA/flashdreams) is a
+high-performance inference and serving framework for interactive
+autoregressive video and world models. It is the closest public reference for
+the execution semantics this RFC targets, especially its OmniDreams integration
+and native `fp8_kvcache_cudnn` path.
+
+FlashDreams uses a per-session autoregressive pipeline:
+
+```python
+cache = pipeline.initialize_cache(...)
+for autoregressive_index, control in enumerate(controls):
+    chunk = pipeline.generate(autoregressive_index, cache, input=control)
+    pipeline.finalize(autoregressive_index, cache)
+```
+
+The split between `generate()` and `finalize()` is important. `generate()` is
+the hot path that runs the denoise loop and returns the current video/latent
+chunk. `finalize()` advances the AR/KV cache for the next chunk; FlashDreams
+explicitly notes that this cache-update work can be moved off the hot path to
+hide latency. This validates the BDE lifecycle rule used in this RFC: **allocate
+once per chunk, reuse/overwrite during the chunk's denoise steps, and advance
+`num_computed_tokens` only when the chunk is committed.**
+
+FlashDreams also provides a direct semantic reference for chunk-window KV:
+`flashdreams.core.attention.kvcache.BlockKVCache` stores KV in a fixed layout:
+
+```text
+[ sink tokens | rolling local-window tokens ]
+```
+
+Its behavior matches the BDE `ChunkWindowSpec` design:
+
+- `sink_size` is protected and never evicted.
+- `window_size` is a bounded rolling window.
+- each update writes exactly one `chunk_size`;
+- repeated updates with the **same** `chunk_idx` overwrite the same physical
+  positions (T>1 denoise semantics), instead of appending new KV;
+- when the window is full, the local window rolls left and the new chunk writes
+  into the rightmost positions.
+
+OmniDreams' native accelerated path further reinforces the target performance
+shape: its default performance profile uses `native_dit_backend =
+"fp8_kvcache_cudnn"` and a cuDNN attention backend, with cache geometry derived
+from `len_t`, `window_size_t`, and `sink_size_t`. Its WebRTC runtime keeps a
+warm session alive, generates one chunk per control interval, and resets the
+rollout/cache only when a new session starts. This is the strongest prior-art
+signal for making BDE's realtime world-model KV lifetime **session-scoped by
+default**, not per-turn.
+
+The key difference is ownership. FlashDreams owns its cache tensors inside the
+framework (`BlockKVCache` per rollout/session). BDE should **not** copy that
+allocator design into vLLM-Omni. Instead, BDE reuses vLLM's `KVCacheManager`,
+`BlockPool`, prefix-cache refcounts, admission gates, and worker `BlockTables`.
+FlashDreams is therefore a semantic and lifecycle reference, while vLLM remains
+the memory-management authority.
+
+### StreamDiffusionV2
+
+[StreamDiffusionV2](https://github.com/chenfengxu714/StreamDiffusionV2) is an
+interactive streaming diffusion system for real-time video-to-video generation.
+It is less directly aligned with vLLM serving than FlashDreams, but it contains
+two useful implementation references for BDE: a **ring-buffer KV cache** for
+sliding-window causal video attention, and a **pipeline-parallel KV rebalance**
+path for multi-GPU streaming.
+
+The single-GPU path exposes a staged loop:
+
+```python
+stream.prepare(prompt)
+for video_chunk in stream.chunk_video(video):
+    encoded = stream.encode_chunk(video, video_chunk, ...)
+    denoised = stream.denoise_chunk(encoded)
+    if denoised is not None:
+        decoded_chunks.append(stream.decode_chunk(denoised))
+```
+
+Internally, the causal Wan model stores per-layer KV in dense dictionaries:
+
+```python
+kv_cache = {
+    "k": ...,
+    "v": ...,
+    "global_end_index": ...,
+    "local_end_index": ...,
+    "total_steps": ...,
+    "current_step": ...,
+}
+```
+
+and maintains an `evict_idx` queue for ring-buffer slot reuse. Once the local
+KV window is full, new chunk KV overwrites the oldest reusable slot instead of
+physically rolling the whole cache. This is an important distinction for BDE:
+the logical chunk window can advance while the physical storage is recycled via
+block-table / slot-mapping updates. In other words, BDE should describe window
+eviction as **logical visibility over vLLM blocks**, not as a required dense
+tensor roll.
+
+StreamDiffusionV2 also has explicit T>1 denoise protection. Its cache tracks
+`current_step` and `total_steps`; repeated denoise passes for the same chunk do
+not pop the eviction queue on every pass. Only after the chunk's denoise group
+is complete does the ring buffer advance. This independently validates BDE's
+rule that repeated denoise steps for the same chunk overwrite the same slots,
+and `num_computed_tokens` advances only at chunk commit.
+
+Two additional ideas are useful but should remain out of the BDE v1 main path:
+
+- **Adaptive sink refresh.** StreamDiffusionV2 optionally compares the average
+  cosine similarity between new K/V and sink K/V (`adapt_sink_threshold`) and
+  refreshes low-similarity sink positions. This is promising for long-running
+  sessions, but complicates vLLM prefix sharing and refcounts, so BDE should
+  keep fixed sinks in v1 and list adaptive sinks as future work.
+- **Pipeline-parallel KV rebalance.** Its distributed
+  `KVCacheManager.compute_block_owners()` /
+  `rebalance_kv_cache_by_diff()` / `broadcast_kv_blocks()` path tracks block
+  interval ownership across ranks and broadcasts moved KV blocks from old owner
+  to new owner. This is not a replacement for vLLM's KV connector, but it is a
+  concrete prior-art pattern for Phase 4 cross-rank / cross-node KV movement.
+
+As with FlashDreams, StreamDiffusionV2 should be treated as a **semantic and
+systems-pattern reference**, not copied as the allocator. BDE still delegates
+allocation, admission, prefix refcounting, and worker block tables to vLLM.
+
+### AR-DiT ecosystem survey
+
+Beyond FlashDreams and StreamDiffusionV2, there is now a small but fast-moving
+open-source ecosystem around AR-DiT / causal video diffusion inference. These
+projects validate the core workload BDE is targeting, but most of them still
+manage KV as model-local dense tensors or method-specific cache state. BDE's
+contribution is to bring the same semantics into vLLM's shared KV allocator,
+scheduler, and paged-attention stack.
+
+| Project | What it contributes | Relevance to BDE |
+| --- | --- | --- |
+| [CausVid](https://github.com/tianweiy/CausVid) | Converts a bidirectional video DiT into a causal / autoregressive generator via DMD-style distillation; provides autoregressive and long-video inference scripts with KV caching. | Baseline AR-DiT inference semantics: causal rollout, few-step denoise, long-video sliding-window inference. |
+| [Self-Forcing](https://self-forcing.github.io/) | Trains AR video diffusion by simulating inference rollout with KV caching, reducing train-test exposure bias. | Supports BDE's chunk-commit rule: cache state should advance according to generated context, not teacher-forced future tokens. |
+| [Causal-Forcing](https://github.com/thu-ml/Causal-Forcing) | Successor to CausVid / Self-Forcing with chunk-wise and frame-wise models for real-time interactive video generation. | Useful for model-surface coverage: BDE should not assume only chunk-wise AR; frame-wise AR is another valid adapter target. |
+| [Rolling Forcing](https://github.com/TencentARC/RollingForcing) | Long-video AR diffusion with rolling-window denoising and attention sinks for multi-minute streaming generation. | Strong reference for fixed sink + rolling window semantics and long-running session behavior. |
+| [FastVideo](https://github.com/hao-ai-lab/FastVideo) | Unified video diffusion inference / post-training framework; includes causal Wan stages with KV and cross-attention cache state. | Reference for integrating causal AR inference into a general video-serving pipeline rather than a one-off script. |
+| [MAGI-1](https://github.com/SandAI-org/MAGI-1) | Large-scale open-source AR video model generating fixed-size chunks (24 frames), with scalable attention infrastructure. | Future reference for high-throughput chunk pipelines and distributed / long-context attention, not a v1 allocator model. |
+| [Forcing-KV](https://github.com/zju-jiyicheng/Forcing-KV) | Inference-side toolkit for hybrid KV cache compression across Self-Forcing, LongLive, Causal Forcing, Rolling Forcing, and others. | Future work for KV compression / memory reduction policies once BDE's base BlockPool integration is stable. |
+
+Design implication: the ecosystem converges on **causal / chunked rollout with
+KV caching**, but not on a common allocator. This strengthens the RFC's core
+decision: vLLM-Omni should not add another model-local KV cache. It should
+normalize these AR-DiT patterns onto vLLM's `KVCacheManager`, `BlockPool`,
+`BlockTables`, and scheduler admission path.
 
 ## Core Decision
 
@@ -606,7 +756,9 @@ Pure DiT models (Flux, Qwen-Image, Wan, Z-Image, Hunyuan-Video, LTX2, …) are
   Flip `skip_reading_prefix_cache` off; compute conditioning `block_hashes`;
   reuse vLLM's prefix index + `ref_cnt`. Migrate SenseNova-U1 / Bagel / NextStep.
 - **Phase 4 (optional) — CPU spill + cross-node KV** via vLLM's KV connector and
-  the Omni connector layer.
+  the Omni connector layer. StreamDiffusionV2's block-owner rebalance can be
+  used as prior art for the rank-ownership protocol, but the transport should
+  still converge on vLLM connector abstractions.
 
 Each phase is independently shippable behind the disabled-by-default flag.
 
@@ -642,8 +794,9 @@ explicit dependencies and handoff interfaces so it can be parallelized.
 | **WP-4** | Runner `BlockTables` + `slot_mapping`, `null_block` re-sync | 1–2 | **A** (block table after CFG/SP shard) | `ForwardContext` paged binding | **F** + diffusion worker |
 | **WP-5** | Paged attention backend, blockwise-causal (`causal=False`) | 1 | attention backend owners | `AttentionMetadata` paged fields (`kv_cache` / `block_table` / `slot_mapping`) | **F** + attention |
 | **WP-6** | **DreamZero** migration + parity gate (sliding-replace / window-reset) | 2 | WP-2, WP-4, WP-5; **C** (#2162) | parity vs cache-off; window config | **C** (DreamZero owner) |
-| **WP-7** | Multiturn session KV lifetime ([Open Q6](#open-questions)): `free()` per-session vs per-turn, preempt during open stream | 2–3 | WP-1; **B**, **D** (#3673) | session→adapter lifetime, free granularity | **B** + **D** |
+| **WP-7** | Multiturn session KV lifetime ([Open Q6](#open-questions)): session-scoped default, reset/preempt semantics for open streams | 2–3 | WP-1; **B**, **D** (#3673) | session→adapter lifetime, `free()` on close/abort | **B** + **D** |
 | **WP-8** | Cross-request prefix reuse + CFG sharing | 3 | WP-1, WP-2; **A** (CFG branch identity) | `block_hashes` + `PrefixKey(CFG branch)` | **F** + **A** |
+| **WP-9** | Optional cross-rank / cross-node KV movement (Phase 4) | 4 | vLLM KV connector; StreamDiffusionV2 owner-rebalance prior art | block owner map → connector transfer | **F** + vLLM core |
 
 ### Coordination / handoff points to agree before coding
 
@@ -653,7 +806,7 @@ explicit dependencies and handoff interfaces so it can be parallelized.
    binding is injected.
 2. **With B (session management):** B owns the long-lived request the adapter
    wraps. It must expose committed-chunk count (→ `num_computed_tokens`) and
-   decide whether KV is freed per turn or per session (WP-7).
+   define the session-scoped `free()` / reset / preempt semantics (WP-7).
 3. **With C (DreamZero):** first real consumer + parity target; picks
    sliding-replace vs window-reset, `chunk_size`, `window_chunks`, `sink_chunks`.
 4. **With D (realtime API):** the multiturn loop decides when chunks are admitted
@@ -682,11 +835,26 @@ explicit dependencies and handoff interfaces so it can be parallelized.
    memory accounting, eviction, and admission unsolved. The compatibility layer
    (Components 1–4) is the actual work; the backend (Component 5) is necessary
    but not sufficient.
-3. **Keep per-model caches; just add a memory guard.**
+3. **Copy FlashDreams' `BlockKVCache` design directly.**
+   FlashDreams is the right semantic reference for `[sink | rolling window]`
+   chunk cache behavior, but its cache is owned by a single rollout/session as
+   dense tensors. Copying it directly would bypass vLLM's shared `BlockPool`,
+   prefix-cache refcounts, admission gates, preemption, and worker
+   `BlockTables`. Rejected as an allocator design; retained as a lifecycle and
+   test-oracle reference.
+4. **Copy StreamDiffusionV2's dense ring-buffer KV directly.**
+   StreamDiffusionV2's `global_end_index` / `local_end_index` / `evict_idx`
+   state machine is a useful reference for logical window movement and T>1
+   overwrite semantics, but its KV cache is still dense model-local state. BDE
+   should not copy that ownership model. Instead, the equivalent operation is:
+   recycle or null out vLLM blocks through `BlockPool`, then rebuild
+   `BlockTables` / `slot_mapping` so the paged backend sees the same logical
+   ring-buffer window.
+5. **Keep per-model caches; just add a memory guard.**
    Lowest effort, but leaves five divergent implementations, no cross-request
    reuse, no scheduler awareness, and no chunk-window eviction. Rejected as a
    long-term answer.
-4. **Fold KV management into the existing `CacheBackend` ABC.**
+6. **Fold KV management into the existing `CacheBackend` ABC.**
    `CacheBackend` models `enable/refresh` for feature caches and intentionally
    ignores memory. Overloading it conflates "skip compute" with "own memory".
    Kept as separate, composable subsystems.
@@ -714,6 +882,15 @@ explicit dependencies and handoff interfaces so it can be parallelized.
 - **Eviction unit tests:** sliding-replace and window-reset, including
   chunk-boundary off-by-one cases and sink protection; verify evicted blocks
   return to `BlockPool` free queue and `null_block` appears in the table.
+- **FlashDreams semantic parity:** mirror the `BlockKVCache` invariants from
+  FlashDreams (`[sink | rolling window]`, same-`chunk_idx` overwrite,
+  chunk-boundary roll) using vLLM `BlockPool` / `BlockTables` instead of dense
+  tensors.
+- **StreamDiffusionV2 ring-buffer parity:** mirror the
+  `global_end_index` / `local_end_index` / `evict_idx` behavior using logical
+  block-table updates. Assert that window advancement does not require dense
+  tensor rolling and that same-chunk repeated denoise steps do not pop the
+  eviction queue.
 - **slot_mapping integrity:** after eviction, runner `slot_mapping` references no
   evicted/`null_block` slot.
 - **T>1 reuse:** allocate once per chunk; steps `1..T-1` reuse the same slots
@@ -744,12 +921,19 @@ explicit dependencies and handoff interfaces so it can be parallelized.
 5. **Hybrid-allocator interaction.** If a model mixes full-attention and
    chunk-window layers, do we rely on vLLM's hybrid KV cache groups, or restrict
    v1 to a single group?
-6. **Multiturn session KV lifetime (#1987 P0).** The World Model RFC's realtime
-   loop accumulates context across turns (observation → prediction → repeat). Does
-   the chunk window persist KV across the whole session (one long-lived
-   `BDERequestAdapter` per session), or is each turn a fresh admission? This
-   determines whether `free()` happens per turn or per session, and how preemption
-   interacts with an open realtime stream.
+6. **Multiturn session KV lifetime (#1987 P0).** Default proposal after reading
+   FlashDreams: keep one long-lived `BDERequestAdapter` / chunk window for the
+   whole realtime session, and call `free()` only when the session closes or is
+   aborted. Still open: how preemption should behave for an open stream, and
+   whether any robotics API path needs a stricter per-turn reset mode.
+7. **Adaptive sink refresh.** StreamDiffusionV2 suggests refreshing sink slots
+   when new K/V becomes dissimilar to old sink K/V. Should BDE support this for
+   long-running sessions? Proposal: not in v1, because sink mutation interacts
+   with prefix sharing and `BlockPool` refcounts.
+8. **Pipeline-parallel KV rebalance.** StreamDiffusionV2 broadcasts moved KV
+   blocks when layer/block ownership changes across ranks. Should BDE expose a
+   similar logical owner map for future pipeline-parallel world-model serving,
+   or rely entirely on vLLM's existing KV connector abstractions?
 
 ---
 
