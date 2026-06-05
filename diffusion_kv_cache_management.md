@@ -767,11 +767,13 @@ sequenceDiagram
     participant RN as ModelRunner
     participant PA as PagedAttention
 
-    Sch->>Ad: add_request builds adapter with num_computed_tokens 0
+    Sch->>Ad: add_request constructs adapter over DiffusionRequestState
+    Ad-->>Sch: returns adapter that duck-types a vllm Request
+    Note over Sch,Ad: scheduler holds the adapter and passes it into every allocate_slots call
 
     rect rgb(235,245,255)
     Note over Sch,BP: admit with full sequence must fit
-    Sch->>KM: allocate_slots for adapter and chunk_size
+    Sch->>KM: allocate_slots with adapter and chunk_size
     KM->>BP: pop free blocks
     BP-->>KM: block ids and increment ref_cnt
     KM-->>Sch: new_blocks or None which defers
