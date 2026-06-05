@@ -41,6 +41,7 @@
   - [Request Lifecycle Integration](#request-lifecycle-integration)
   - [Chunk Window Eviction Semantics](#chunk-window-eviction-semantics)
   - [T>1 Denoise Semantics](#t1-denoise-semantics)
+  - [Multimodal segment alignment (audio-visual)](#multimodal-segment-alignment-audio-visual)
 - [Migration of Existing Models](#migration-of-existing-models)
 - [Phased Rollout](#phased-rollout)
 - [Work Breakdown & Cross-Workstream Ownership](#work-breakdown--cross-workstream-ownership)
@@ -962,6 +963,83 @@ When a chunk is denoised over `T > 1` steps, each step is a forward over the
 This matches HunyuanImage3's "compute once, reuse across steps" behavior, now
 expressed against the paged pool.
 
+### Multimodal segment alignment (audio-visual)
+
+Everything above assumes a **single** token timeline with one `chunk_size`. Joint
+audio-visual world models break that assumption, and this is the
+segment-↔-`KVCacheSpec` alignment gap. The reference model is
+[**OmniForcing**](https://omniforcing.com/) (distills the bidirectional LTX-2,
+14B video + 5B audio, into a block-causal streaming generator). Its relevant
+properties:
+
+- **Asymmetric per-second token counts.** The video VAE emits `fv = 3` latent
+  frames/s while the audio VAE emits `fa = 25` frames/s — a non-integer `25:3`
+  ratio. A single scalar `num_computed_tokens` and a single `chunk_size` cannot
+  index both streams.
+- **Macro-block alignment.** OmniForcing groups one physical second
+  (`ΔT = 1 s` ⇒ 3 video + 25 audio latent frames) into one synchronized block
+  `B_k`, with a zero-truncation **Global Prefix** anchoring the joint sequence at
+  exact one-second boundaries (exploiting the VAE stride: stride 1 on the first
+  frame, full strides after).
+- **Modality-independent rolling KV-cache.** Each modality keeps its **own**
+  rolling window (`O(L)` per step), and the two streams run concurrently;
+  cross-modal coupling happens only at **A2V / V2A** attention boundaries.
+- **Audio attention sink** with **Identity RoPE** — a small position-agnostic
+  global memory that must never be evicted.
+
+**Why this maps cleanly onto vLLM (not a fork).** vLLM already models a request
+as a set of `KVCacheGroupSpec`s (`kv_cache_groups` in `KVCacheConfig`): each
+group is a set of layers that share one block table and is treated as one
+"manager layer". Hybrid models (full + sliding-window, attention + Mamba) already
+use multiple groups with different specs. BDE reuses exactly this:
+
+| OmniForcing concept | BDE mapping (reused vLLM machinery) |
+| --- | --- |
+| video stream KV | `KVCacheGroup` keyed by a video `ChunkWindowSpec` (segment = `fv` frames) |
+| audio stream KV | `KVCacheGroup` keyed by an audio `ChunkWindowSpec` (segment = `fa` frames) |
+| macro-block `B_k` (1 s) | the joint **scheduling + eviction unit**: both groups admit/evict together at the macro-block boundary |
+| Global Prefix | per-group pinned prefix blocks (`sink_chunks`), never evicted, anchored at the macro-block boundary |
+| Audio sink + Identity RoPE | `sink_chunks > 0` on the audio `ChunkWindowSpec`; the sink region is excluded from `get_num_skipped_tokens` |
+| modality-independent rolling window | each group's `ChunkWindowManager` evicts on **its own** segment granularity |
+
+So "segment ↔ `KVCacheSpec` alignment" concretely means: **each modality gets its
+own `ChunkWindowSpec` whose `block_size`/segment maps to that modality's latent
+frames-per-second, and the scheduler advances/evicts both groups on a shared
+macro-block tick** so audio and video never drift.
+
+**Recommended integration (one request, two KV groups).** Keep a single BDE
+request and give it two KV cache groups. The `BDERequestAdapter` is extended from
+a scalar `num_computed_tokens` to a **per-group** count (video and audio advance
+by their own per-segment token counts, but `on_chunk_committed()` is called once
+per macro-block so they stay locked). This is the smallest change that preserves
+modality-independent windows while reusing the coordinator, `BlockPool`, and
+`ref_cnt` unchanged.
+
+**The one genuinely new interface gap: cross-modal block tables.** For the A2V /
+V2A sync layers, a layer in the video group must attend over **audio** KV (and
+vice versa). vLLM's per-layer paged attention reads only its own group's block
+table, so these sync layers need a **composed block table spanning both groups**
+for that one attention call. This is the multimodal analog of the single-modality
+"compose the block table to express cross-chunk causality" point, and it is the
+main item to prototype before committing to dual-stream models. Intra-layer
+decoupled (audio-only / video-only) layers are unaffected — they use their own
+group's table as usual.
+
+**Alternatives (documented, not chosen):**
+
+- *Two independent requests, one per modality.* Simpler per-stream windows, but
+  cross-modal attention now needs **cross-request** KV reads, which vLLM does not
+  do natively, and the scheduler must hand-synchronize two request lifetimes.
+- *Single interleaved sequence (pack audio+video into one timeline).* Fits the
+  existing single-timeline path with zero adapter changes, but loses
+  modality-independent rolling windows and concurrent per-stream execution — the
+  exact properties that make OmniForcing real-time.
+
+This is **explicitly out of scope for Phase 0–3** (single-timeline models first);
+it is called out here so the `ChunkWindowSpec`/adapter interfaces are designed to
+**not preclude** a per-group extension later. See
+[Open Questions](#open-questions) for the page-size-uniformity constraint.
+
 ## Migration of Existing Models
 
 Strictly opt-in and incremental. For each model:
@@ -1186,6 +1264,15 @@ explicit dependencies and handoff interfaces so it can be parallelized.
    only when layer/block ownership changes across ranks. Should BDE ever expose
    a logical owner map for such dynamic ownership, or rely entirely on vLLM's
    existing PP and KV connector abstractions?
+9. **Multimodal page-size uniformity (OmniForcing, see
+   [Multimodal segment alignment](#multimodal-segment-alignment-audio-visual)).**
+   Per-modality KV groups have different head dims / layer counts (e.g. 14B video
+   vs 5B audio), hence different `page_size_bytes`. vLLM's
+   `_get_kv_cache_config_uniform_page_size` groups specs under a shared page size;
+   can audio and video groups coexist under that grouping unchanged, or does BDE
+   need a padding / per-group page-size relaxation? And what is the cleanest place
+   to express a **cross-group composed block table** for A2V/V2A sync layers —
+   the runner's `BlockTables` builder, or a small attention-metadata extension?
 
 ---
 
