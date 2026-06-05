@@ -803,6 +803,105 @@ sequenceDiagram
     end
 ```
 
+#### Diagram walkthrough: BDE KV lifecycle
+
+The step numbers below follow the rendered `autonumber` sequence diagram.
+
+**Stage 1 — Request entry (steps 1–2).**
+
+1. **`add_request` constructs adapter over `DiffusionRequestState`:**
+   the scheduler constructs a `BDERequestAdapter` for the new request. The
+   adapter starts with `num_computed_tokens = 0`. It is a structural duck-type,
+   not a real vLLM `Request`; it only implements the fields the KV manager reads
+   (`request_id`, `num_computed_tokens`, `num_tokens`, `block_hashes`,
+   `skip_reading_prefix_cache`, `num_preemptions`, etc.).
+2. **Adapter returns the decorated request view:** the adapter is handed back to
+   the scheduler. The scheduler holds this same object and passes it into every
+   later `allocate_slots()` / `free()` call. This makes the adapter the
+   request-lifetime bridge between diffusion state and vLLM's KV manager.
+
+**Stage 2 — Admission gate (blue `rect`, steps 3–6).**
+
+This block corresponds to `full_sequence_must_fit=True`: the request is admitted
+only if the KV cache can hold the required sequence after accounting for prefix
+cache hits and window eviction. If it cannot fit, the request is deferred rather
+than admitted and later forced into preemption or OOM.
+
+3. **`allocate_slots` with adapter and `chunk_size`:** the scheduler asks
+   `KVCacheManager` to allocate slots for the request, using the adapter as the
+   vLLM-compatible request view.
+4. **`pop free blocks`:** `KVCacheManager` asks `BlockPool` for free physical
+   KV blocks.
+5. **`block ids and increment ref_cnt`:** `BlockPool` returns block ids and
+   increments their reference counts. `ref_cnt` is what later makes shared
+   prefix / CFG reuse and safe release possible.
+6. **`new_blocks or None which defers`:** `KVCacheManager` returns the allocated
+   blocks, or `None` if the request cannot fit. `None` means the scheduler
+   defers the request and does not force it into the running set.
+
+**Stage 3 — Per-chunk generation (`loop each new chunk k`, steps 7–15).**
+
+This is the core loop. Every newly generated chunk follows the same sequence:
+first release blocks that fell outside the chunk window, then allocate blocks
+for the current chunk, then run `T` denoise steps on the same slots.
+
+7. **`allocate_slots` for adapter and `chunk_size`:** request slots for chunk
+   `k`.
+8. **`get_num_skipped_tokens` snaps to chunk boundary:** `KVCacheManager` calls
+   `ChunkWindowManager` to compute how many tokens/chunks are now outside the
+   window. The result snaps to chunk boundaries so a chunk is never half-evicted.
+9. **`remove_skipped_blocks` returns old chunks to free queue:** blocks belonging
+   to out-of-window chunks are returned to `BlockPool`. This happens before new
+   allocation, so blocks freed by the old chunk can immediately be reused in the
+   same scheduler step.
+10. **`pop blocks for chunk k`:** `KVCacheManager` asks `BlockPool` for physical
+    blocks for the current chunk. This is intentionally mediated by `BlockPool`;
+    `ChunkWindowManager` decides what may be freed, but it does not directly
+    assign blocks to the next chunk.
+11. **`block ids`:** `BlockPool` returns the physical block ids to
+    `KVCacheManager`.
+12. **`block ids`:** `KVCacheManager` forwards those block ids to
+    `ModelRunner`.
+13. **`build BlockTables and slot_mapping`:** `ModelRunner` maps logical chunk
+    positions to physical block ids, producing the `BlockTables` and
+    `slot_mapping` consumed by paged attention.
+
+**Inner denoise loop (`loop denoise step t in 1..T`, step 14).**
+
+14. **`write K and V into the same slots in place`:** a diffusion chunk is
+    denoised for `T` steps. Each denoise step writes K/V back into the same
+    allocated slots; it does not append blocks and does not call
+    `allocate_slots()` again. Therefore `allocate_slots()` runs once per chunk,
+    while steps `2..T` reuse the same `slot_mapping`.
+
+The yellow note, **blockwise-causal, bidirectional within chunk**, describes the
+attention semantics: cross-chunk causality is structural, enforced by which
+blocks appear in the `BlockTables`; within the current chunk, attention remains
+bidirectional (`causal=False`), matching the world-model semantics from
+[World Model RFC (#1987)](https://github.com/vllm-project/vllm-omni/issues/1987).
+
+15. **`on_chunk_committed` advances `num_computed_tokens` by `chunk_size`:**
+    only after all `T` denoise steps for a chunk finish does the adapter advance
+    `num_computed_tokens`. It advances once per chunk, not once per denoise
+    step, which is the key invariant behind T>1 in-place KV reuse.
+
+**Stage 4 — Preempt or finish (`alt`, steps 16–18).**
+
+There are two terminal paths:
+
+16. **Preempt:** `free adapter then BlockPool decref, recompute on resume`.
+    Preemption drops the request's KV ownership; if the request resumes later,
+    its KV is recomputed.
+17. **Finish:** `free adapter`. On normal completion, the scheduler releases the
+    request from the KV manager.
+18. **Shared-prefix release:** `BlockPool` decrements references. Shared prefix
+    blocks are physically freed only when `ref_cnt` reaches zero, preventing one
+    request from deleting blocks still referenced by another request.
+
+The core contrast with today's DreamZero path is that allocation, window
+eviction, in-place T>1 updates, and release are all expressed through vLLM's
+paged KV ownership model rather than private dense tensors inside model state.
+
 What changes semantically:
 
 | Aspect | DreamZero today | BDE (proposed) |
