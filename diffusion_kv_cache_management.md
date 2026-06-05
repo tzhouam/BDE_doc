@@ -37,6 +37,7 @@
   - [Component 4: Runner BlockTables + slot_mapping](#component-4-runner-blocktables--slot_mapping)
   - [Component 5: Paged attention (blockwise-causal)](#component-5-paged-attention-blockwise-causal)
   - [Configuration Surface](#configuration-surface)
+  - [Sequence: KV management — DreamZero today vs BDE](#sequence-kv-management--dreamzero-today-vs-bde)
   - [Request Lifecycle Integration](#request-lifecycle-integration)
   - [Chunk Window Eviction Semantics](#chunk-window-eviction-semantics)
   - [T>1 Denoise Semantics](#t1-denoise-semantics)
@@ -692,6 +693,125 @@ class DiffusionKVCacheConfig:
 When `enable=False` (default), behavior is **byte-for-byte the current path** —
 models keep their existing code until migrated. The RFC is strictly additive at
 first.
+
+### Sequence: KV management — DreamZero today vs BDE
+
+The two diagrams below contrast how KV cache is **allocated, updated, windowed,
+and freed** in the current DreamZero model-local path versus the proposed BDE
+path that reuses vLLM's paged KV stack. They are grounded in the real code:
+`vllm_omni/diffusion/models/dreamzero/state_dreamzero.py`
+(`create_kv_caches` / `update_kv_cache` / `reset`) and
+`causal_wan_model.py` (`self_attn` rolling `cat` + `[-max_attention_size:]`
+slice) for the "today" side, and `KVCacheManager` / `BlockPool` /
+`ChunkWindowManager` for the "proposed" side.
+
+#### Today — DreamZero model-local dense rolling KV
+
+KV lives **inside the model state object**, one dense contiguous tensor per
+layer, grown by `torch.cat` and trimmed by a tensor slice every denoise step.
+The window is enforced by slicing; there is no pool, no paging, and no
+cross-request sharing. CFG keeps a **second** full copy (`kv_cache_neg`).
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Srv as Serving / Pipeline
+    participant St as DreamZeroState
+    participant M as CausalWanModel.self_attn
+    participant G as GPU memory (dense tensors)
+
+    Srv->>St: reset() on session start / should_reset()
+    Note over St: kv_cache = None, kv_cache_neg = None
+
+    Srv->>St: _prefill_kv_cache()
+    St->>G: create_kv_caches() → per-layer torch.zeros(2,B,0,H,D)
+    Note over St,G: two dense caches (positive + negative for CFG)
+
+    loop each chunk (num_frame_per_block frames)
+        loop each denoise step t = 1..T
+            Srv->>M: forward(x, kv_cache=state.get_kv_caches())
+            M->>M: new_k = cat([cache_k, roped_key]); new_v = cat([cache_v, v])
+            M->>M: new_k = new_k[-max_attention_size:]  (rolling window by slice)
+            M->>M: attn(q, new_k, new_v)  causal within concat tensor
+            M-->>St: update_kv_cache(layer, stack(new_k,new_v))  (whole tensor rewrite)
+        end
+        Note over G: cache tensor physically grows then is re-trimmed every step
+    end
+
+    Srv->>St: should_reset() / explicit reset → reset()
+    St->>G: drop kv_cache (freed by GC, no pool reuse)
+```
+
+Pain points this makes visible: the per-step `cat`+slice rewrites the whole
+layer tensor (allocation churn), the window is a model-private convention not a
+scheduler contract, CFG doubles memory, and freed memory returns to the
+allocator rather than a reusable block pool — so no cross-request prefix sharing
+is possible.
+
+#### Proposed — BDE over vLLM paged KV
+
+KV blocks come from a **shared `BlockPool`**; the diffusion request is presented
+to the unmodified `KVCacheManager` via `BDERequestAdapter`. Windowing is a
+scheduler-level contract enforced by `ChunkWindowManager` (evict at chunk
+boundaries, blocks returned to the free queue), and `T>1` denoise reuses the
+**same** slots in place.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Sch as DiffusionScheduler
+    participant Ad as BDERequestAdapter
+    participant KM as KVCacheManager
+    participant CW as ChunkWindowManager
+    participant BP as BlockPool
+    participant RN as ModelRunner
+    participant PA as PagedAttention (causal=False)
+
+    Sch->>Ad: add_request → build adapter (num_computed_tokens=0)
+
+    rect rgb(235,245,255)
+    Note over Sch,BP: admit (full_sequence_must_fit=True)
+    Sch->>KM: allocate_slots(adapter, chunk_size)
+    KM->>BP: pop free blocks → block ids
+    BP-->>KM: block ids (ref_cnt++)
+    KM-->>Sch: new_blocks (None ⇒ defer)
+    end
+
+    loop each new chunk k
+        Sch->>KM: allocate_slots(adapter, chunk_size)
+        KM->>CW: get_num_skipped_tokens() (snap to chunk boundary)
+        CW->>BP: remove_skipped_blocks() → return old chunks to free queue
+        KM->>BP: pop blocks for chunk k
+        BP-->>KM: block ids
+        KM-->>RN: block ids
+        RN->>RN: build BlockTables → slot_mapping for chunk k
+
+        loop denoise step t = 1..T (no new allocation)
+            RN->>PA: forward, write K/V into the SAME slots (in-place)
+            Note over PA: blockwise-causal: causal=False over present blocks
+        end
+        RN-->>Ad: on_chunk_committed() → num_computed_tokens += chunk_size
+    end
+
+    alt preempt
+        Sch->>KM: free(adapter) → BlockPool decref (recompute on resume)
+    else finish
+        Sch->>KM: free(adapter)
+        KM->>BP: decref; shared prefix blocks freed when ref_cnt → 0
+    end
+```
+
+What changes semantically:
+
+| Aspect | DreamZero today | BDE (proposed) |
+| --- | --- | --- |
+| Storage | dense per-layer tensor in model state | paged blocks from shared `BlockPool` |
+| Allocation | `torch.zeros(…,0,…)` grown by `cat` | `KVCacheManager.allocate_slots()` |
+| Window | `[-max_attention_size:]` slice every step | `ChunkWindowManager` evicts at chunk boundary |
+| Update (`T>1`) | rewrite whole tensor each step | in-place write to same `slot_mapping` |
+| CFG | second full cache (`kv_cache_neg`) | distinct request/blocks; poolable, shareable |
+| Free | drop tensor → allocator | `free()` → blocks back to pool (`ref_cnt`) |
+| Cross-request reuse | none | prefix index + `ref_cnt` (Phase 3) |
 
 ### Request Lifecycle Integration
 
