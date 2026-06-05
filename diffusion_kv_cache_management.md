@@ -717,29 +717,29 @@ sequenceDiagram
     autonumber
     participant Srv as Serving / Pipeline
     participant St as DreamZeroState
-    participant M as CausalWanModel.self_attn
-    participant G as GPU memory (dense tensors)
+    participant M as self_attn
+    participant G as GPU memory
 
-    Srv->>St: reset() on session start / should_reset()
-    Note over St: kv_cache = None, kv_cache_neg = None
+    Srv->>St: reset on session start or should_reset
+    Note over St: kv_cache and kv_cache_neg set to None
 
-    Srv->>St: _prefill_kv_cache()
-    St->>G: create_kv_caches() → per-layer torch.zeros(2,B,0,H,D)
-    Note over St,G: two dense caches (positive + negative for CFG)
+    Srv->>St: prefill_kv_cache
+    St->>G: create_kv_caches per-layer zeros of shape 2 x B x 0 x H x D
+    Note over St,G: two dense caches positive plus negative for CFG
 
-    loop each chunk (num_frame_per_block frames)
-        loop each denoise step t = 1..T
-            Srv->>M: forward(x, kv_cache=state.get_kv_caches())
-            M->>M: new_k = cat([cache_k, roped_key]); new_v = cat([cache_v, v])
-            M->>M: new_k = new_k[-max_attention_size:]  (rolling window by slice)
-            M->>M: attn(q, new_k, new_v)  causal within concat tensor
-            M-->>St: update_kv_cache(layer, stack(new_k,new_v))  (whole tensor rewrite)
+    loop each chunk
+        loop each denoise step t in 1..T
+            Srv->>M: forward with kv_cache from get_kv_caches
+            M->>M: new_k = concat of cache_k and roped_key
+            M->>M: trim to last max_attention_size tokens by slice
+            M->>M: attn over q new_k new_v
+            M-->>St: update_kv_cache writes whole tensor back
         end
-        Note over G: cache tensor physically grows then is re-trimmed every step
+        Note over G: tensor grows then re-trimmed every step
     end
 
-    Srv->>St: should_reset() / explicit reset → reset()
-    St->>G: drop kv_cache (freed by GC, no pool reuse)
+    Srv->>St: should_reset or explicit reset
+    St->>G: drop kv_cache to allocator, no pool reuse
 ```
 
 Pain points this makes visible: the per-step `cat`+slice rewrites the whole
@@ -765,39 +765,39 @@ sequenceDiagram
     participant CW as ChunkWindowManager
     participant BP as BlockPool
     participant RN as ModelRunner
-    participant PA as PagedAttention (causal=False)
+    participant PA as PagedAttention
 
-    Sch->>Ad: add_request → build adapter (num_computed_tokens=0)
+    Sch->>Ad: add_request builds adapter with num_computed_tokens 0
 
     rect rgb(235,245,255)
-    Note over Sch,BP: admit (full_sequence_must_fit=True)
-    Sch->>KM: allocate_slots(adapter, chunk_size)
-    KM->>BP: pop free blocks → block ids
-    BP-->>KM: block ids (ref_cnt++)
-    KM-->>Sch: new_blocks (None ⇒ defer)
+    Note over Sch,BP: admit with full sequence must fit
+    Sch->>KM: allocate_slots for adapter and chunk_size
+    KM->>BP: pop free blocks
+    BP-->>KM: block ids and increment ref_cnt
+    KM-->>Sch: new_blocks or None which defers
     end
 
     loop each new chunk k
-        Sch->>KM: allocate_slots(adapter, chunk_size)
-        KM->>CW: get_num_skipped_tokens() (snap to chunk boundary)
-        CW->>BP: remove_skipped_blocks() → return old chunks to free queue
+        Sch->>KM: allocate_slots for adapter and chunk_size
+        KM->>CW: get_num_skipped_tokens snaps to chunk boundary
+        CW->>BP: remove_skipped_blocks returns old chunks to free queue
         KM->>BP: pop blocks for chunk k
         BP-->>KM: block ids
         KM-->>RN: block ids
-        RN->>RN: build BlockTables → slot_mapping for chunk k
+        RN->>RN: build BlockTables and slot_mapping for chunk k
 
-        loop denoise step t = 1..T (no new allocation)
-            RN->>PA: forward, write K/V into the SAME slots (in-place)
-            Note over PA: blockwise-causal: causal=False over present blocks
+        loop denoise step t in 1..T with no new allocation
+            RN->>PA: write K and V into the same slots in place
+            Note over PA: blockwise-causal, bidirectional within chunk
         end
-        RN-->>Ad: on_chunk_committed() → num_computed_tokens += chunk_size
+        RN-->>Ad: on_chunk_committed advances num_computed_tokens by chunk_size
     end
 
     alt preempt
-        Sch->>KM: free(adapter) → BlockPool decref (recompute on resume)
+        Sch->>KM: free adapter then BlockPool decref, recompute on resume
     else finish
-        Sch->>KM: free(adapter)
-        KM->>BP: decref; shared prefix blocks freed when ref_cnt → 0
+        Sch->>KM: free adapter
+        KM->>BP: decref, shared prefix blocks freed when ref_cnt hits 0
     end
 ```
 
