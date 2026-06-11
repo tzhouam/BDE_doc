@@ -1078,7 +1078,8 @@ Pure DiT models (Flux, Qwen-Image, Wan, Z-Image, Hunyuan-Video, LTX2, …) are
   re-sync in the worker `BlockTables` view. Migrate a chunked world-model.
 - **Phase 3 — Cross-request prefix reuse + CFG sharing.**
   Flip `skip_reading_prefix_cache` off; compute conditioning `block_hashes`;
-  reuse vLLM's prefix index + `ref_cnt`. Migrate SenseNova-U1 / Bagel / NextStep.
+  reuse vLLM's prefix index + `ref_cnt`. Migrate SenseNova-U1 / Bagel / NextStep. 
+  See [prefix key design](prefix_key_design.md) for further details.
 - **Phase 4 (optional) — CPU spill + cross-node KV** via vLLM's KV connector and
   the Omni connector layer. Static PP should continue to use vLLM's existing
   rank-local KV ownership. StreamDiffusionV2's block-owner rebalance is only
