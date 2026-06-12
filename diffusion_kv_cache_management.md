@@ -1,19 +1,11 @@
-# [RFC] Unified KV Cache Management for vLLM-Omni Diffusion
+# [RFC] Unified KV Cache Management for the vLLM-Omni AR-Diffusion Engine
 
-!!! warning "Proposal / Draft"
-    This is a design proposal (RFC). It describes a subsystem that does not yet
-    exist as a unified component. The per-model KV reuse paths referenced here
-    (HunyuanImage3, SenseNova-U1, Bagel, NextStep) are real and ad-hoc today;
-    this RFC proposes consolidating them onto vLLM's mainline KV cache stack.
+**Scope.** This RFC targets the **AR-Diffusion engine** — the Block Diffusion
+Engine (BDE) that serves autoregressive, hybrid, and chunked blockwise-causal
+diffusion models (world models, AR-DiT). Pure non-AR DiT models (Flux,
+Qwen-Image, Wan, …) materialize no persistent KV and are explicitly out of
+scope (see [Non-Goals](#goals-and-non-goals)).
 
-- **Status:** Draft
-- **Feedback period:** 1 week (minimum)
-- **Owners:** Diffusion runtime
-- **Related docs:**
-  [Diffusion Step Execution](diffusion_step_execution.md),
-  [Continuous Batching for Step-Wise Diffusion](diffusion_continuous_batching.md),
-  [cache-dit](cache_dit.md), [TeaCache](teacache.md),
-  [Automatic Prefix Caching in Omni Models](prefix_caching.md)
 - **Upstream RFC:**
   [World Model Support (#1987)](https://github.com/vllm-project/vllm-omni/issues/1987).
   That roadmap lists "Page-attention and KV cache management for Autoregressive
@@ -413,6 +405,11 @@ B1/B2 — and re-creates the rejected diffusion-local route (see
 
 ## Terminology
 
+- **AR-Diffusion engine / BDE (Block Diffusion Engine)**: the vLLM-Omni
+  execution engine for **autoregressive** diffusion — models that generate
+  chunk-by-chunk with blockwise-causal attention and persistent KV (world
+  models, AR-DiT, hybrid AR+DiT). This RFC's subject; "BDE" throughout refers
+  to this engine.
 - **DiT**: Diffusion Transformer (denoiser run N times over the latent).
 - **AR/hybrid model**: a model whose denoiser is a causal/GPT-style transformer
   that maintains attention KV (e.g. HunyuanImage3).
@@ -1405,7 +1402,4 @@ explicit dependencies and handoff interfaces so it can be parallelized.
 ---
 
 ### CC List
-
-(Fill in maintainers of `vllm_omni/diffusion/` scheduler, worker, cache, and the
-HunyuanImage3 / SenseNova-U1 model owners, plus vLLM core KV cache owners for the
-`spec_manager_map` registration.)
+@hsliuustc0106 @Gaohan123 @ywang96 @amy-why-3459 @TKONIY @asukaqaq-s
