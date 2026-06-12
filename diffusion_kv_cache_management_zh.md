@@ -1,7 +1,9 @@
-# [RFC] vLLM-Omni Diffusion 的统一 KV Cache 管理
+# [RFC] vLLM-Omni AR-Diffusion Engine 的统一 KV Cache 管理
 
 !!! warning "提案 / 草案"
-    这是一份设计提案（RFC）。它描述的是一个尚未作为统一组件存在的子系统。文中提到的按模型实现的 KV 复用路径（HunyuanImage3、SenseNova-U1、Bagel、NextStep）今天都是真实存在但较为临时的实现；本 RFC 建议将它们收敛到 vLLM 主线的 KV cache 栈之上。
+    这是一份设计提案（RFC）。它描述的是一个尚未作为统一组件存在的子系统。文中提到的按模型实现的 KV 复用路径（HunyuanImage3、SenseNova-U1、 Bagel、NextStep）今天都是真实存在但较为临时的实现；本 RFC 建议将它们收敛到 vLLM 主线的 KV cache 栈之上。
+
+**范围。** 本 RFC 面向 **AR-Diffusion engine** —— Block Diffusion Engine（BDE），用于服务自回归、混合式、以及分块 blockwise-causal 的 diffusion 模型（world model、AR-DiT）。纯非 AR 的 DiT 模型（Flux、Qwen-Image、Wan 等）不产生持久 KV，**明确不在范围内**（见[非目标](#goals-and-non-goals)）。
 
 - **状态：** 草案
 - **反馈周期：** 至少 1 周
@@ -11,9 +13,11 @@
   [Continuous Batching for Step-Wise Diffusion](diffusion_continuous_batching.md),
   [cache-dit](cache_dit.md), [TeaCache](teacache.md),
   [Automatic Prefix Caching in Omni Models](prefix_caching.md)
-- **上游 RFC：**
-  [World Model Support (#1987)](https://github.com/vllm-project/vllm-omni/issues/1987)。
-  该路线图在 *Future* 中列出了 “Page-attention and KV cache management for Autoregressive Diffusion”；本 RFC 即为该条目的设计方案。
+- **相关 RFC：**
+  [World Model Support (#1987)](https://github.com/vllm-project/vllm-omni/issues/1987)、
+  [Unified KV Cache Management for the AR-Diffusion Engine (#4366)](https://github.com/vllm-project/vllm-omni/issues/4366)
+- **上游路线图：** #1987 在 *Future* 中列出了 “Page-attention and KV cache management for Autoregressive Diffusion”；本文是该条目的详细设计。
+- **英文版 / 工作副本：** [BDE_doc](https://github.com/tzhouam/BDE_doc/blob/main/diffusion_kv_cache_management.md)
 
 ---
 
@@ -33,9 +37,11 @@
   - [组件 4：Runner BlockTables + slot_mapping](#component-4-runner-blocktables--slot_mapping)
   - [组件 5：Paged attention（blockwise-causal）](#component-5-paged-attention-blockwise-causal)
   - [配置入口](#configuration-surface)
+  - [序列图：DreamZero 现状 vs BDE](#sequence-kv-management--dreamzero-today-vs-bde)
   - [请求生命周期集成](#request-lifecycle-integration)
   - [Chunk Window 驱逐语义](#chunk-window-eviction-semantics)
   - [T>1 Denoise 语义](#t1-denoise-semantics)
+  - [多模态 segment 对齐（音视频）](#multimodal-segment-alignment-audio-visual)
 - [现有模型迁移](#migration-of-existing-models)
 - [分阶段上线](#phased-rollout)
 - [工作拆解与跨工作流 Owner](#work-breakdown--cross-workstream-ownership)
@@ -65,6 +71,27 @@ vLLM-Omni 的 diffusion 栈已经有成熟的 **feature/step cache** 层（`vllm
 3. **没有跨 step 契约。** “只计算一次 conditioning KV，并在 denoise step 之间复用” 这件事在每个模型里重复发明，且各自带着细微不同的不变量（`gen_timestep_scatter_index`、CFG batch layout、SP sharding）。
 4. **没有 scheduler 集成。** diffusion scheduler（`sched/interface.py`）会跟踪请求生命周期（`WAITING` / `RUNNING` / `PREEMPTED` / `FINISHED_*`），但没有 KV residency 概念。被 preempt 的请求无法释放或恢复 KV；continuous batching 在接纳请求时也无法推理 KV 容量。
 5. **没有 chunk-window eviction。** 只保留最近 `W` 个 chunk 的 world-model 目前都在手动 free/realloc。没有一个 allocator 理解“驱逐窗口之外的所有内容”，同时保护 attention sink。
+6. **碎片化与分配抖动。** 手写 cache 通过 `torch.cat` + slice（DreamZero）或 per-request `torch.zeros` 增长，每步重写整张 tensor，频繁触发 CUDA allocator 的 alloc/free。高并发下 HBM 碎片化、可承载 batch 低于物理容量上限，并产生难以复现的 OOM。
+7. **缺少 rollback / lookahead 原语（交互式流）。** 实时 world-model 会话（causal-WAN 风格）需要**中断**生成、**回滚**到上一个 chunk 边界（例如用户 steer rollout），或**推测性 lookahead**。Dense model-local tensor 只能破坏性截断；scheduler 无法驱动 chunk 级 release/restore 契约。
+8. **分叉点处共享失效。** 即使两个分支共享 conditioning prefix（多参考图请求、CFG 正负分支），一旦 KV 在中途**分叉**，dense 布局必须整段拷贝 prefix。Copy-on-divergence 需要分页/分段存储 + per-block `ref_cnt` —— dense per-request tensor 无法表达。
+
+### 新架构的预期收益
+
+统一、与 vLLM 对齐的设计带来的收益，按痛点编号映射：
+
+| # | 对应痛点 | BDE 分页 KV 的收益 | 主要场景 |
+| --- | --- | --- | --- |
+| B1 | (2), (8) | **Prefix 共享 + 廉价分叉**：共享 conditioning（系统指令、参考图 token、CFG 负分支）算一次，经 `ref_cnt` 共享；分叉后仅 post-divergence blocks 私有，无需拷贝 prefix | 云测：KV 显存 ≈ `(1−p)+p/S`；多参考图、CFG 负载 |
+| B2 | (1), (6) | **减碎片、更大 batch**：预 sizing 的统一 `BlockPool` 替代 per-stream 最坏情况 dense 预留；admission control 替代 OOM | 高并发下每 GPU 吞吐 |
+| B3 | (6) | **消除每步 alloc/free 抖动**：每 chunk 分配一次，T 步 denoise 原地写；无 `cat`+slice 整 tensor 重写 | 步延迟稳定性、长会话显存曲线 |
+| B4 | (5), (7) | **Chunk 级生命周期成为 scheduler 契约**：动态 KV 增长、window 驱逐、**chunk 级 release/rollback/lookahead** 都变成 block-table 操作 | 实时交互：中断、steer、重生成 |
+| B5 | (3), (4) | **一套契约替代 N 套实现**：HunyuanImage3 / SenseNova-U1 / Bagel / NextStep 迁移到统一路径；新 AR-DiT 模型免费获得 KV 管理 | 维护成本、接入速度 |
+| B6 | — | **生态对齐**：复用 vLLM `KVCacheManager`/`BlockPool` 继承上游 prefix-cache、hybrid-allocator、KV-connector 改进；并为 **RL 训练环**留口子（`verl-omni : vllm-omni` 对应 `verl : vllm`） | RL post-training、上游特性继承 |
+
+两条 framing 说明：
+
+- **端测 vs 云测。** 单流交互（端测）主要获得 B3/B4；B1/B2 随并发和 prefix 共享放大，是**云测 batch serving** 收益，应在 batch 下评估。
+- **B1 与 B2 是独立杠杆。** Prefix reuse 需要流量中有共享 conditioning；pooling/碎片化收益不需要 prefix 共享。分开汇报，避免“prefix 命中率低 ⇒ 没收益”的混淆。
 
 <a id="background-what-exists-today"></a>
 ## 背景：今天已有的内容
@@ -201,6 +228,9 @@ New compatibility layers (the deliverables of this RFC):
 
 此前提出的 `DiffusionKVCacheManager`（新的 diffusion-local block pool + prefix index + profiler + eviction policy）被**拒绝**，并移至[替代方案](#alternatives-considered)：它会 fork 出第二套 allocator、refcount 模型、prefix index 和 eviction policy，而我们之后必须永远让它与 vLLM 保持同步。
 
+**库级复用，而非框架级复用。** 审阅意见
+（[BDE_doc #1](https://github.com/tzhouam/BDE_doc/issues/1)）指出：diffusion scheduler/runner **不应**被“嵌入”vLLM 框架；它们保持独立，只是**调用** `KVCacheManager` 作为**库**，通过 `BDERequestAdapter` 传入 duck-typed request view。这与“把 diffusion 变成 vLLM LLM engine 的一个 mode”不同——后者会强迫 scheduler/runner 继承 vLLM 的 token-decode 假设。当前设计已经是库级复用；更轻量的“只导入 block table + kernels、跳过 manager”方案见[替代方案 7](#alternatives-considered)。
+
 <a id="goals-and-non-goals"></a>
 ## 目标与非目标
 
@@ -223,6 +253,7 @@ New compatibility layers (the deliverables of this RFC):
 <a id="terminology"></a>
 ## 术语
 
+- **AR-Diffusion engine / BDE（Block Diffusion Engine）**：vLLM-Omni 面向**自回归** diffusion 的执行引擎——按 chunk 生成、采用 blockwise-causal attention 并维护持久 KV 的模型（world model、AR-DiT、混合 AR+DiT）。本文 RFC 的主题；后文 “BDE” 均指该引擎。
 - **DiT**：Diffusion Transformer（denoiser 会在 latent 上运行 N 次）。
 - **AR/hybrid model**：denoiser 是 causal/GPT-style transformer，并维护 attention KV 的模型（例如 HunyuanImage3）。
 - **Chunk**：world-model 中用于 KV 记账的自回归生成单元：模型每前进一个 causal attention block 时物化的一组持久 self-attention tokens。每个 chunk 有 `chunk_size` 个 token。对 DreamZero 来说，它对应 `num_frame_per_block * frame_seqlen`，而不是一次 OpenPI serving request，也不是外层 4 帧观测聚合（`FRAMES_PER_CHUNK`）。first-frame prefill 是一个特殊 prefix，长度为 `frame_seqlen`；action/state registers 只是 per-forward tokens，会参与 attention，但不属于持久 self-attention KV。
@@ -476,6 +507,153 @@ class DiffusionKVCacheConfig:
 
 当 `enable=False`（默认）时，行为与当前路径**逐字节一致**，模型在迁移前继续保留现有代码。RFC 一开始是严格 additive 的。
 
+<a id="sequence-kv-management--dreamzero-today-vs-bde"></a>
+### 序列图：DreamZero 现状 vs BDE
+
+下面两张序列图对比 KV cache 在 **当前 DreamZero model-local 路径**与**复用 vLLM 分页 KV 栈的 BDE 路径**中如何分配、更新、窗口化与释放。它们基于真实代码：`vllm_omni/diffusion/models/dreamzero/state_dreamzero.py`（`create_kv_caches` / `update_kv_cache` / `reset`）和 `causal_wan_model.py`（`self_attn` 滚动 `cat` + `[-max_attention_size:]` slice）代表“现状”，`KVCacheManager` / `BlockPool` / `ChunkWindowManager` 代表“提案”。
+
+#### 现状 — DreamZero model-local dense rolling KV
+
+KV **存在于 model state 对象内部**，每层一个 dense 连续 tensor，通过 `torch.cat` 增长、每 denoise step 用 slice 裁剪。窗口由 slice 强制；没有 pool、没有 paging、没有跨请求共享。CFG 保留**第二份**完整拷贝（`kv_cache_neg`）。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Srv as Serving / Pipeline
+    participant St as DreamZeroState
+    participant M as self_attn
+    participant G as GPU memory
+
+    Srv->>St: reset on session start or should_reset
+    Note over St: kv_cache and kv_cache_neg set to None
+
+    Srv->>St: prefill_kv_cache
+    St->>G: create_kv_caches per-layer zeros of shape 2 x B x 0 x H x D
+    Note over St,G: two dense caches positive plus negative for CFG
+
+    loop each chunk
+        loop each denoise step t in 1..T
+            Srv->>M: forward with kv_cache from get_kv_caches
+            M->>M: new_k = concat of cache_k and roped_key
+            M->>M: trim to last max_attention_size tokens by slice
+            M->>M: attn over q new_k new_v
+            M-->>St: update_kv_cache writes whole tensor back
+        end
+        Note over G: tensor grows then re-trimmed every step
+    end
+
+    Srv->>St: should_reset or explicit reset
+    St->>G: drop kv_cache to allocator, no pool reuse
+```
+
+可见痛点：每步 `cat`+slice 重写整层 tensor（分配抖动）；窗口是 model-private 约定而非 scheduler 契约；CFG 双倍内存；释放后内存回到 allocator 而非可复用 block pool——因此无法跨请求 prefix 共享。
+
+#### 提案 — BDE over vLLM paged KV
+
+KV block 来自**共享 `BlockPool`**；diffusion request 通过 `BDERequestAdapter` 呈现给未修改的 `KVCacheManager`。窗口化是 scheduler 级契约，由 `ChunkWindowManager` 在 chunk 边界驱逐；`T>1` denoise **原地**复用同一 slot。
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Sch as DiffusionScheduler
+    participant Ad as BDERequestAdapter
+    participant KM as KVCacheManager
+    participant CW as ChunkWindowManager
+    participant BP as BlockPool
+    participant RN as ModelRunner
+    participant PA as PagedAttention
+
+    Sch->>Ad: add_request constructs adapter over DiffusionRequestState
+    Ad-->>Sch: returns adapter that duck-types a vllm Request
+    Note over Sch,Ad: scheduler holds the adapter and passes it into every allocate_slots call
+
+    rect rgb(235,245,255)
+    Note over Sch,BP: admit with full sequence must fit
+    Sch->>KM: allocate_slots with adapter and chunk_size
+    KM->>BP: pop free blocks
+    BP-->>KM: block ids and increment ref_cnt
+    KM-->>Sch: new_blocks or None which defers
+    end
+
+    loop each new chunk k
+        Sch->>KM: allocate_slots for adapter and chunk_size
+        KM->>CW: get_num_skipped_tokens snaps to chunk boundary
+        CW->>BP: remove_skipped_blocks returns old chunks to free queue
+        KM->>BP: pop blocks for chunk k
+        BP-->>KM: block ids
+        KM-->>RN: block ids
+        RN->>RN: build BlockTables and slot_mapping for chunk k
+
+        loop denoise step t in 1..T with no new allocation
+            RN->>PA: write K and V into the same slots in place
+            Note over PA: blockwise-causal, bidirectional within chunk
+        end
+        RN-->>Ad: on_chunk_committed advances num_computed_tokens by chunk_size
+    end
+
+    alt preempt
+        Sch->>KM: free adapter then BlockPool decref, recompute on resume
+    else finish
+        Sch->>KM: free adapter
+        KM->>BP: decref, shared prefix blocks freed when ref_cnt hits 0
+    end
+```
+
+#### 序列图逐步解读：BDE KV 生命周期
+
+以下步骤编号与渲染后的 `autonumber` 序列图一致。
+
+**阶段 1 — 请求入口（步骤 1–2）。**
+
+1. **`add_request` 构造 adapter：** scheduler 为新请求构造 `BDERequestAdapter`，初始 `num_computed_tokens = 0`。它是结构化 duck-type，不是真实 vLLM `Request`；只实现 KV manager 读取的字段。
+2. **Adapter 返回 decorated request view：** scheduler 持有同一对象，并在后续每次 `allocate_slots()` / `free()` 中传入。Adapter 是 diffusion state 与 vLLM KV manager 之间的 request-lifetime 桥梁。
+
+**阶段 2 — Admission gate（蓝色 `rect`，步骤 3–6）。**
+
+对应 `full_sequence_must_fit=True`：只有 KV cache 在 prefix hit 和 window eviction 之后仍能容纳所需序列时才接纳；否则 defer，而非强行 admission 导致 preempt/OOM。
+
+3. **`allocate_slots` with adapter and `chunk_size`：** scheduler 用 adapter 作为 vLLM 兼容 request view 请求 slot。
+4. **`pop free blocks`：** `KVCacheManager` 向 `BlockPool` 索取空闲物理 block。
+5. **`block ids and increment ref_cnt`：** 返回 block id 并递增引用计数；`ref_cnt` 使 prefix/CFG 共享与安全释放成为可能。
+6. **`new_blocks or None which defers`：** 返回 allocated blocks，或 `None`（scheduler defer）。
+
+**阶段 3 — 逐 chunk 生成（`loop each new chunk k`，步骤 7–15）。**
+
+核心循环：先释放窗口外 block，再为当前 chunk 分配，再在相同 slot 上运行 `T` 个 denoise step。
+
+7. **`allocate_slots` for chunk `k`。**
+8. **`get_num_skipped_tokens` 对齐 chunk 边界：** 计算窗口外 token/chunk 数，snap 到 chunk 边界，避免半驱逐。
+9. **`remove_skipped_blocks` 归还 free queue：** 窗口外 block 在**新分配之前**归还 `BlockPool`，同一步可立即复用。
+10. **`pop blocks for chunk k`：** 通过 `BlockPool` 分配；`ChunkWindowManager` 决定可释放哪些 block，但不直接分配下一 chunk。
+11–12. **`block ids` 转发至 ModelRunner。**
+13. **`build BlockTables and slot_mapping`：** 将 logical chunk 位置映射到物理 block id。
+
+**内层 denoise loop（步骤 14）。**
+
+14. **原地写入 K/V：** 每个 chunk 经 `T` 步 denoise，每步写入同一 slot；不追加 block、不再次 `allocate_slots()`。黄色注释 **blockwise-causal, bidirectional within chunk** 表示跨 chunk causality 由 block table 结构表达，chunk 内 attention 双向（`causal=False`）。
+
+15. **`on_chunk_committed` 增加 `num_computed_tokens`：** 仅在该 chunk 全部 `T` 步完成后 advance；每 chunk 一次，而非每 denoise step 一次——这是 T>1 原地复用的关键不变量。
+
+**阶段 4 — Preempt 或 finish（`alt`，步骤 16–18）。**
+
+16. **Preempt：** `free adapter`，`BlockPool` decref；resume 时重新计算 KV。
+17. **Finish：** 正常完成时 scheduler 释放 request。
+18. **共享 prefix 释放：** `ref_cnt` 归零时才物理释放共享 prefix block。
+
+与 DreamZero 现状的核心对比：分配、window eviction、T>1 原地更新、释放都通过 vLLM 分页 KV ownership 表达，而非 model state 内的 private dense tensor。
+
+语义对比：
+
+| 方面 | DreamZero 现状 | BDE（提案） |
+| --- | --- | --- |
+| 存储 | model state 内 dense per-layer tensor | 共享 `BlockPool` 的分页 block |
+| 分配 | `torch.zeros(…,0,…)` + `cat` 增长 | `KVCacheManager.allocate_slots()` |
+| 窗口 | 每步 `[-max_attention_size:]` slice | `ChunkWindowManager` chunk 边界驱逐 |
+| 更新（`T>1`） | 每步重写整 tensor | 同一 `slot_mapping` 原地写 |
+| CFG | 第二份完整 cache（`kv_cache_neg`） | 独立 request/blocks；可 pool、可共享 |
+| 释放 | drop tensor → allocator | `free()` → block 回 pool（`ref_cnt`） |
+| 跨请求复用 | 无 | prefix index + `ref_cnt`（Phase 3） |
+
 <a id="request-lifecycle-integration"></a>
 ### 请求生命周期集成
 
@@ -489,6 +667,15 @@ class DiffusionKVCacheConfig:
 | `finish_requests` | `kv_cache_manager.free(adapter)`；`BlockPool` decref 共享 prefix blocks |
 
 因为 diffusion 每个 chunk 的 step 数是**固定且已知**的，并且 conditioning KV 对 step 不变，所以常见情况是：每个 chunk 分配，旧 chunk 由 `ChunkWindowManager` 驱逐，并且永不无界增长。
+
+#### Prefix-cache 生命周期：admission 时匹配一次
+
+<a id="prefix-cache-lifecycle-match-once-at-admission"></a>
+审阅讨论后澄清（[BDE_doc #1](https://github.com/tzhouam/BDE_doc/issues/1)）；匹配纪律与 vLLM LLM serving 一致：
+
+- **匹配只发生一次，在 waiting 状态。** `get_computed_blocks(adapter)` 在 admission 前探测 prefix index，请求进入 `RUNNING` 之前完成。Running 请求**不再**重新探测：chunk 与 denoise step 复用已解析的 `num_computed_tokens`、block id、`BlockTables` 和 `slot_mapping`。BDE_doc #1 中的 reviewer 测量表明，在合理 `block_size` 下，这种一次性匹配成本相对请求总 runtime 可忽略。
+- **DiT 风格模型（HunyuanImage3）：** request 级生命周期与 vLLM LLM serving 相同——admission 时 match，所有 denoise step 复用，`finish` 时 `free()`。唯一扩展是 **image/conditioning token 可 hash 且可 cache**（见 `prefix_key_design.md`）。
+- **流式模型（CausalWAN 风格）：** 生命周期为 **session-scoped**（开放问题 6）：session 已提交 KV 通过 long-lived adapter 保持 pinned；session 内每个短 control request 进入时**至多一次** prefix match——不会每步 re-hash session history。这与 Omni repo 中流式 audio 模型的 session 级 prefix-cache 设计一致。
 
 <a id="chunk-window-eviction-semantics"></a>
 ### Chunk Window 驱逐语义
@@ -509,6 +696,54 @@ class DiffusionKVCacheConfig:
 - 在该 chunk 的 `T` 个 step 内，attention 会把 K/V 写入**同一组**已分配 slot（in-place update），而不是追加新 slot。因此每个 chunk 只调用一次 `allocate_slots`，step `1..T-1` 复用该 chunk 的 `slot_mapping`。
 
 这与 HunyuanImage3 的“计算一次，跨 step 复用”行为一致，只是现在表达在 paged pool 之上。
+
+<a id="multimodal-segment-alignment-audio-visual"></a>
+### 多模态 segment 对齐（音视频）
+
+上文假设**单一** token 时间线与一个 `chunk_size`。联合音视频 world model 打破该假设——这是 segment ↔ `KVCacheSpec` 对齐缺口。参考模型是 [**OmniForcing**](https://omniforcing.com/)（将双向 LTX-2、14B video + 5B audio 蒸馏为 block-causal 流式生成器）。相关性质：
+
+- **每秒 token 数不对称。** Video VAE 输出 `fv = 3` latent frames/s，audio VAE 输出 `fa = 25` frames/s——非整数 `25:3` 比。单一标量 `num_computed_tokens` 与单一 `chunk_size` 无法同时索引两路流。
+- **Macro-block 对齐。** OmniForcing 将物理 1 秒（`ΔT = 1 s` ⇒ 3 video + 25 audio latent frames）分组为同步 block `B_k`，并用 zero-truncation **Global Prefix** 在精确整秒边界锚定联合序列。
+- **模态独立 rolling KV-cache。** 每模态保留**各自** rolling window（每步 `O(L)`），两路并发；跨模态耦合仅发生在 **A2V / V2A** attention 边界。
+- **Audio attention sink** 与 **Identity RoPE** —— 小型 position-agnostic 全局记忆，永不可驱逐。
+
+**Attention segment：逻辑层。** 遵循审阅建议（[BDE_doc #1](https://github.com/tzhouam/BDE_doc/issues/1)），我们显式命名逻辑抽象，并与物理 cache layout 分离。**Attention segment** 描述 token 范围的*含义*，与 KV 物理位置无关：
+
+```python
+@dataclass(frozen=True)
+class AttentionSegment:
+    modality: str          # "video" | "audio" | "text" | "latent" | ...
+    role: str              # "global_prefix" | "sink" | "history_chunk" | "current_chunk"
+    visibility: str        # 谁可 attend："intra_modality" | "cross_modal" | "all"
+    cacheable: bool        # 是否 eligible for KV residency / prefix reuse
+    token_range: range     # 该模态 logical timeline 中的位置
+```
+
+Segment 语义回答“这段 token 是什么、谁可见、可否 cache”；**物理层**（KV groups、`ChunkWindowSpec`、block tables、`slot_mapping`）回答“KV block 在哪、如何驱逐”。两者通过映射关联，不合并：segment 不命名 block id，allocator 不解释 modality。这使同一套物理机制可服务单时间线模型（一条 segment 流、一个 group）与双流模型（每模态 segments、每模态一个 group），而无需 fork 任一层。
+
+**为何能干净映射到 vLLM（无需 fork）。** vLLM 已将 request 建模为一组 `KVCacheGroupSpec`（`KVCacheConfig.kv_cache_groups`）：每组共享一个 block table，视为一个 “manager layer”。Hybrid 模型（full + sliding-window、attention + Mamba）已用多 group、不同 spec。BDE 将 **segments → groups** 映射如下：
+
+| OmniForcing 概念 | BDE 映射（复用 vLLM 机制） |
+| --- | --- |
+| video stream KV | 以 video `ChunkWindowSpec` 为 key 的 `KVCacheGroup`（segment = `fv` frames） |
+| audio stream KV | 以 audio `ChunkWindowSpec` 为 key 的 `KVCacheGroup`（segment = `fa` frames） |
+| macro-block `B_k`（1 s） | 联合 **scheduling + eviction 单元**：两 group 在 macro-block 边界同步 admit/evict |
+| Global Prefix | 每 group pinned prefix blocks（`sink_chunks`），永不驱逐，锚定在 macro-block 边界 |
+| Audio sink + Identity RoPE | audio `ChunkWindowSpec` 上 `sink_chunks > 0`；sink 区域从 `get_num_skipped_tokens` 排除 |
+| 模态独立 rolling window | 各 group 的 `ChunkWindowManager` 按**各自** segment 粒度驱逐 |
+
+因此 “segment ↔ `KVCacheSpec` 对齐” 具体指：**每模态一个 `ChunkWindowSpec`，其 `block_size`/segment 映射到该模态 latent frames-per-second；scheduler 在共享 macro-block tick 上 advance/evict 两 group**，使 audio 与 video 不漂移。
+
+**推荐集成（一个 request，两个 KV group）。** 保持单个 BDE request，赋予两个 KV cache group。`BDERequestAdapter` 从标量 `num_computed_tokens` 扩展为 **per-group** 计数（video/audio 按各自 segment token 数 advance，但 `on_chunk_committed()` 每 macro-block 调用一次以保持锁定）。这是在复用 coordinator、`BlockPool`、`ref_cnt` 不变前提下，保留模态独立 window 的最小改动。
+
+**真正新的接口缺口：跨模态 block table。** 对 A2V / V2A sync layer，video group 中的 layer 必须 attend **audio** KV（反之亦然）。vLLM per-layer paged attention 只读自身 group 的 block table，因此这些 sync layer 需要**一次 attention 调用 spanning 两 group 的 composed block table**。这是单模态 “compose block table 表达跨 chunk causality” 的多模态类比，是 commit 双流模型前需原型的主要项。模态内 decoupled layer 不受影响——照常使用各自 group 的 table。
+
+**替代方案（文档化，未选用）：**
+
+- *每模态两个独立 request。* 每流 window 更简单，但跨模态 attention 需 **cross-request** KV 读，vLLM 原生不支持，且 scheduler 须手工同步两 request 生命周期。
+- *单一 interleaved 序列（audio+video 打包到一条 timeline）。* 零 adapter 改动即可走现有单时间线路径，但失去模态独立 rolling window 与并发 per-stream 执行——正是 OmniForcing 实时性的核心。
+
+**Phase 0–3 明确不在范围内**（先做单时间线模型）；此处列出是为 `ChunkWindowSpec`/adapter 接口设计**不阻碍**后续 per-group 扩展。见[开放问题](#open-questions)中的 page-size 一致性约束。
 
 <a id="migration-of-existing-models"></a>
 ## 现有模型迁移
@@ -600,6 +835,7 @@ class DiffusionKVCacheConfig:
    成本最低，但仍保留五个发散实现，没有跨请求复用、没有 scheduler awareness，也没有 chunk-window eviction。作为长期方案被拒绝。
 6. **把 KV management 折叠进现有 `CacheBackend` ABC。**
    `CacheBackend` 建模的是 feature cache 的 `enable/refresh`，并有意忽略内存。重载它会混淆“跳过计算”和“持有内存”。保持为独立且可组合的子系统。
+7. **只把 block table + 分页 kernel 导入 runner；跳过 manager。**（[BDE_doc #1](https://github.com/tzhouam/BDE_doc/issues/1) 建议的更轻集成。）可获得分页存储与原地写（Layer-1 收益），但丢弃 `BlockPool` `ref_cnt`、prefix index 与 admission gate——因此无跨请求 prefix/CFG 共享（B1）、无 capacity-gated admission（B2），eviction/rollback 策略须在 diffusion 侧重实现，最终收敛回替代方案 1。**拒绝**；当前设计已是库级复用：scheduler/runner 保持独立，仅调用 manager（见[核心决策](#core-decision)）。
 
 <a id="risks-and-mitigations"></a>
 ## 风险与缓解措施
@@ -635,15 +871,17 @@ class DiffusionKVCacheConfig:
 
 1. **paged `kv_cache` + `block_table` 应该从哪里传入 diffusion attention path**：在 `AttentionMetadata` 上新增 typed field，还是通过 `extra`？（倾向 typed field，语义更清晰；不存在该字段时 backend 忽略。）
 2. **DiT prompts 的 block size。** Conditioning 通常较短（几十到几百 token）。粗粒度 `block_size` 与 `chunk_size` 对齐问题：`block_size` 是否应整除 `chunk_size`？
-3. **Prefix hashing 粒度（Phase 3）。** hash raw token ids（更便宜，与 vLLM 对齐）还是 post-`encode_prompt` embeddings（对带 prompt preprocessing 的模型更精确）？
+3. **Prefix hashing 粒度（Phase 3）。** hash raw token ids（更便宜，与 vLLM 对齐）还是 post-`encode_prompt` embeddings（对带 prompt preprocessing 的模型更精确）？关于匹配**成本**：[BDE_doc #1](https://github.com/tzhouam/BDE_doc/issues/1) 的 reviewer 测量表明，较大 `block_size` 下 prefix 匹配开销可忽略，且匹配仅在 waiting 状态每请求运行一次（见[Prefix-cache 生命周期](#prefix-cache-lifecycle-match-once-at-admission)）——因此开放部分是粒度/精度，而非开销。
 4. **CFG sharing 安全性。** 是否存在 unconditional branch conditioning 并非 request-independent 的模型（true-CFG per-request negatives）？这类模型必须退出跨请求复用。
 5. **Hybrid-allocator 交互。** 如果一个模型混合 full-attention 和 chunk-window layers，我们是否依赖 vLLM 的 hybrid KV cache groups，还是 v1 限制为单一 group？
 6. **Multiturn session KV lifetime（#1987 P0）。** 阅读 FlashDreams 后的默认提案：整个 realtime session 保持一个 long-lived `BDERequestAdapter` / chunk window，并且只在 session close 或 abort 时调用 `free()`。仍开放：open stream 的 preemption 应如何表现，以及是否有 robotics API 路径需要更严格的 per-turn reset mode。
 7. **Adaptive sink refresh。** StreamDiffusionV2 建议当新 K/V 与旧 sink K/V 差异较大时刷新 sink slots。BDE 是否应为 long-running session 支持它？提案：v1 不支持，因为 sink mutation 会与 prefix sharing 和 `BlockPool` refcount 交互。
 8. **Dynamic KV-owner rebalance。** vLLM 的静态 PP 已经覆盖常见场景：每个 rank 拥有固定 layer shard，本地保存该 shard 的 KV，并在 rank 间传递 activation。StreamDiffusionV2 只会在 layer/block ownership 跨 rank 变化时广播被移动的 KV blocks。BDE 是否未来需要为这种动态 ownership 暴露 logical owner map，还是完全依赖 vLLM 现有 PP 和 KV connector abstractions？
+9. **多模态 page-size 一致性（OmniForcing，见[多模态 segment 对齐](#multimodal-segment-alignment-audio-visual)）。** 每模态 KV group 的 head dim / layer 数不同（如 14B video vs 5B audio），故 `page_size_bytes` 不同。vLLM 的 `_get_kv_cache_config_uniform_page_size` 在共享 page size 下分组 spec；audio 与 video group 能否在该分组下不变共存，还是 BDE 需要 padding / per-group page-size 放宽？A2V/V2A sync layer 的 **cross-group composed block table** 最 cleanly 表达在 runner `BlockTables` builder 还是小型 attention-metadata 扩展？
+10. **Chunk 级 rollback / lookahead 语义（收益 B4）。** 回滚到 chunk 边界自然对应 “释放 boundary 之后所有 block + 回退 `num_computed_tokens`”；推测性 lookahead 映射到 vLLM `num_lookahead_tokens` slot 分配。但：rollback 是否与 prefix caching 交互（已回滚 block 可能已 hash-publish）？交互式 session 是否需要 block-table **快照**（廉价、ref_cnt'd），还是 v1 可接受从 boundary 重算？
 
 ---
 
 ### CC List
 
-（填入 `vllm_omni/diffusion/` scheduler、worker、cache 的 maintainer，以及 HunyuanImage3 / SenseNova-U1 模型 owner，再加上负责 `spec_manager_map` 注册的 vLLM core KV cache owner。）
+@hsliuustc0106 @Gaohan123 @ywang96 @amy-why-3459 @TKONIY @asukaqaq-s
