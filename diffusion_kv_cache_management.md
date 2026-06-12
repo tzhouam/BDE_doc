@@ -106,6 +106,47 @@ state living on the model module:
 5. **No chunk-window eviction.** World-models that only keep the last `W` chunks
    alive currently free/realloc by hand. There is no allocator that understands
    "evict everything older than the window" while protecting attention sinks.
+6. **Fragmentation and allocation churn.** Hand-rolled caches grow by
+   `torch.cat` + slice (DreamZero) or per-request `torch.zeros`, which rewrites
+   whole tensors every step and hits the CUDA allocator with frequent
+   alloc/free. Under high concurrency this fragments HBM, caps the achievable
+   batch size below what raw capacity allows, and produces hard-to-reproduce
+   OOMs.
+7. **No rollback / lookahead primitives for interactive streams.** Realtime
+   world-model sessions (causal-WAN style) need to **interrupt** generation,
+   **roll back** to a previous chunk boundary (e.g. user steers the rollout),
+   or **speculatively look ahead**. Dense model-local tensors can only be
+   truncated destructively; there is no chunk-level release/restore contract
+   the scheduler can drive.
+8. **Sharing breaks at the divergence point.** Even when two branches share a
+   conditioning prefix (multi-reference-image requests, CFG
+   positive/negative), the moment their KV **diverges** mid-sequence a dense
+   layout must copy the whole prefix. Copy-on-divergence requires
+   paged/segmented storage with per-block reference counting — exactly what a
+   dense per-request tensor cannot express.
+
+### Expected benefits of the new architecture
+
+What the unified, vLLM-aligned design buys us, mapped pain-point → benefit:
+
+| # | Pain point (above) | Benefit with paged BDE KV | Where it shows up |
+| --- | --- | --- | --- |
+| B1 | (2), (8) | **Prefix sharing with cheap divergence**: shared conditioning (system instruction, reference-image tokens, CFG negative branch) is computed once and shared via `ref_cnt`; when branches diverge, only post-divergence blocks are private — no prefix copy | Cloud serving: KV memory ≈ `(1−p) + p/S` of dense per request; multi-ref-image and CFG workloads |
+| B2 | (1), (6) | **Less fragmentation, bigger batches**: fixed-size blocks from one pre-sized pool (`gpu_memory_utilization`-style budget) instead of per-stream worst-case dense reservations; admission control replaces OOM | Throughput per GPU at high concurrency |
+| B3 | (6) | **No per-step alloc/free churn**: blocks are allocated once per chunk and written in place across `T` denoise steps; no `cat`+slice whole-tensor rewrites, far fewer CUDA allocator calls | Step latency stability; long-session memory stability |
+| B4 | (5), (7) | **Chunk-level lifecycle as a scheduler contract**: dynamic KV growth (causal-WAN), window eviction, **chunk-level release / rollback / lookahead** all become block-table operations (`free` blocks past a boundary, snapshot/restore a table prefix) instead of tensor surgery | Realtime interactive sessions: interrupt, steer, re-generate |
+| B5 | (3), (4) | **One contract instead of N reimplementations**: per-model hand-rolled caches (HunyuanImage3, SenseNova-U1, Bagel, NextStep) migrate onto one audited path; new AR-DiT models get KV management for free | Maintenance cost; time-to-integrate new models |
+| B6 | — | **Ecosystem alignment**: staying on vLLM's `KVCacheManager`/`BlockPool` inherits prefix-cache, hybrid-allocator, KV-connector, and spill improvements upstream — and keeps the door open for an **RL training loop on top** (a `verl-omni : vllm-omni` pairing mirroring `verl : vllm`), since RL rollout engines assume vLLM's paged KV + preemption semantics | Future RL post-training (self-forcing-style rollouts); upstream feature inheritance |
+
+Two framing notes for sizing these benefits:
+
+- **Edge vs cloud.** A single interactive stream (edge) sees mainly B3/B4;
+  B1/B2 scale with concurrency and prefix sharing, so the capacity and reuse
+  wins are **cloud-serving** benefits and should be evaluated at batch.
+- **B1 and B2 are independent levers.** Prefix reuse needs shared
+  conditioning in the traffic; pooling/fragmentation wins need none — they
+  apply to any KV-bound batch. Reporting them separately avoids the "prefix
+  hit-rate is low, therefore no benefit" conflation.
 
 ## Background: What Exists Today
 
@@ -325,6 +366,20 @@ pool + prefix index + profiler + eviction policy) is **rejected** and moved to
 [Alternatives](#alternatives-considered): it would fork a second allocator,
 refcount model, prefix index, and eviction policy that we would then have to
 keep in sync with vLLM forever.
+
+**Library-level reuse, not framework reuse.** A review comment
+([BDE_doc #1](https://github.com/tzhouam/BDE_doc/issues/1)) suggested a lighter
+variant — let the runner import only the block table and paged kernels, keeping
+everything else independent — on the assumption that this RFC adopts vLLM's
+scheduler/runner as frameworks. To be explicit: it does not. The diffusion
+scheduler and `DiffusionModelRunner` remain fully independent and own the
+execution path; they *call into* `KVCacheManager.allocate_slots()/free()` as a
+**library**, through `BDERequestAdapter`. What distinguishes this from the
+"block table + kernels only" variant is precisely the manager layer: dropping
+`KVCacheManager`/`BlockPool` also drops `ref_cnt` (prefix/CFG sharing), the
+prefix index, and the admission gate (`full_sequence_must_fit`) — i.e. benefits
+B1/B2 — and re-creates the rejected diffusion-local route (see
+[Alternative 7](#alternatives-considered)).
 
 ## Goals and Non-Goals
 
@@ -930,6 +985,31 @@ Because diffusion runs a **fixed, known** number of steps per chunk and
 conditioning KV is step-invariant, the common case is: allocate per chunk, evict
 old chunks via `ChunkWindowManager`, never grow unbounded.
 
+#### Prefix-cache lifecycle: match once at admission
+
+Clarified after review discussion
+([BDE_doc #1](https://github.com/tzhouam/BDE_doc/issues/1)); the matching
+discipline mirrors vLLM LLM serving:
+
+- **Matching happens once, in the waiting state.** `get_computed_blocks(adapter)`
+  probes the prefix index at admission, before the request enters `RUNNING`.
+  Running requests never re-probe: chunk and denoise steps reuse the already
+  resolved `num_computed_tokens`, block ids, `BlockTables`, and `slot_mapping`.
+  Reviewer-measured data in BDE_doc #1 shows that with a reasonably large
+  `block_size`, this one-shot matching cost is insignificant relative to a
+  request's runtime.
+- **DiT-style models (HunyuanImage3):** the request-level lifecycle is the same
+  as vLLM LLM serving — match at admission, reuse during all denoise steps,
+  `free()` at finish. The only extension is that **image/conditioning tokens
+  become hashable and cacheable** (see the prefix-key design doc,
+  `prefix_key_design.md`).
+- **Streaming models (CausalWAN-style):** the lifecycle is **session-scoped**
+  (Open Q6): the session's committed KV stays pinned via the long-lived adapter,
+  and each short control request *within* the session performs **at most one**
+  prefix match on entry — it does not re-hash session history every step. This
+  matches the session-level prefix-cache design used for streaming audio models
+  in the Omni repo.
+
 ### Chunk Window Eviction Semantics
 
 Two configurable strategies, both implemented as the `get_num_skipped_tokens`
@@ -987,11 +1067,37 @@ properties:
 - **Audio attention sink** with **Identity RoPE** — a small position-agnostic
   global memory that must never be evicted.
 
+**Attention segments: the logical layer.** Following a review suggestion
+([BDE_doc #1](https://github.com/tzhouam/BDE_doc/issues/1)), we name the logical
+abstraction explicitly and keep it separate from the physical cache layout. An
+**attention segment** describes the *meaning* of a token range, independent of
+where its KV physically lives:
+
+```python
+@dataclass(frozen=True)
+class AttentionSegment:
+    modality: str          # "video" | "audio" | "text" | "latent" | ...
+    role: str              # "global_prefix" | "sink" | "history_chunk" | "current_chunk"
+    visibility: str        # who may attend to it: "intra_modality" | "cross_modal" | "all"
+    cacheable: bool        # eligible for KV residency / prefix reuse
+    token_range: range     # position in that modality's logical timeline
+```
+
+Segment semantics answer "what is this token range, who can see it, may it be
+cached"; the **physical layer** (KV groups, `ChunkWindowSpec`, block tables,
+`slot_mapping`) answers "where do its KV blocks live and how are they evicted".
+The two are linked by a mapping, not merged: a segment never names block ids,
+and the allocator never interprets modality. This split is what lets the same
+physical machinery serve single-timeline models (one segment stream, one group)
+and dual-stream models (segments per modality, one group per modality) without
+forking either layer.
+
 **Why this maps cleanly onto vLLM (not a fork).** vLLM already models a request
 as a set of `KVCacheGroupSpec`s (`kv_cache_groups` in `KVCacheConfig`): each
 group is a set of layers that share one block table and is treated as one
 "manager layer". Hybrid models (full + sliding-window, attention + Mamba) already
-use multiple groups with different specs. BDE reuses exactly this:
+use multiple groups with different specs. BDE maps **segments → groups** onto
+exactly this:
 
 | OmniForcing concept | BDE mapping (reused vLLM machinery) |
 | --- | --- |
@@ -1186,6 +1292,16 @@ explicit dependencies and handoff interfaces so it can be parallelized.
    `CacheBackend` models `enable/refresh` for feature caches and intentionally
    ignores memory. Overloading it conflates "skip compute" with "own memory".
    Kept as separate, composable subsystems.
+7. **Import only the block table + paged kernels into the runner; skip the
+   manager.** (Suggested in [BDE_doc #1](https://github.com/tzhouam/BDE_doc/issues/1)
+   as a lighter integration.) This gets paged storage and in-place writes
+   (layer-1 benefits) but discards `BlockPool` `ref_cnt`, the prefix index, and
+   the admission gate — so no cross-request prefix/CFG sharing (B1), no
+   capacity-gated admission (B2), and eviction/rollback policy must be
+   re-implemented diffusion-side, converging back on Alternative 1. Rejected;
+   note the current design is already "library-level": the scheduler/runner stay
+   independent and merely call the manager (see
+   [Core Decision](#core-decision)).
 
 ## Risks and Mitigations
 
@@ -1242,7 +1358,12 @@ explicit dependencies and handoff interfaces so it can be parallelized.
    divide `chunk_size`?
 3. **Prefix hashing granularity (Phase 3).** Hash raw token ids (cheaper, aligns
    with vLLM) or post-`encode_prompt` embeddings (precise for models with prompt
-   preprocessing)?
+   preprocessing)? On matching **cost**: reviewer measurements in
+   [BDE_doc #1](https://github.com/tzhouam/BDE_doc/issues/1) show that with a
+   larger `block_size`, prefix-matching overhead is insignificant, and matching
+   runs only once per request in the waiting state (see
+   [Prefix-cache lifecycle](#prefix-cache-lifecycle-match-once-at-admission)) —
+   so the open part is granularity/precision, not overhead.
 4. **CFG sharing safety.** Are there models whose unconditional branch
    conditioning is *not* request-independent (true-CFG per-request negatives)?
    Those must opt out of cross-request reuse.
@@ -1273,6 +1394,13 @@ explicit dependencies and handoff interfaces so it can be parallelized.
    need a padding / per-group page-size relaxation? And what is the cleanest place
    to express a **cross-group composed block table** for A2V/V2A sync layers —
    the runner's `BlockTables` builder, or a small attention-metadata extension?
+10. **Chunk-level rollback / lookahead semantics (benefit B4).** Rolling back to
+    a chunk boundary is naturally "free all blocks past boundary + rewind
+    `num_computed_tokens`", and speculative lookahead maps to vLLM's
+    `num_lookahead_tokens` slot allocation. But: does rollback interact with
+    prefix caching (rolled-back blocks may already be hash-published)? And does
+    an interactive session need block-table **snapshots** (cheap, ref_cnt'd) or
+    is recompute-from-boundary acceptable for v1?
 
 ---
 
