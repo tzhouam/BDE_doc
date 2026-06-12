@@ -23,6 +23,7 @@ scope (see [Non-Goals](#goals-and-non-goals)).
 - [Terminology](#terminology)
 - [Proposed Design](#proposed-design)
   - [Architecture Overview](#architecture-overview)
+    - [Reuse map — green / yellow / red](#reuse-map--green--yellow--red)
   - [Component 1: BDERequestAdapter](#component-1-bderequestadapter)
   - [Component 2: ChunkWindowSpec / ChunkWindowManager](#component-2-chunkwindowspec--chunkwindowmanager)
   - [Component 3: Scheduler admission deltas](#component-3-scheduler-admission-deltas)
@@ -469,10 +470,95 @@ B1/B2 — and re-creates the rejected diffusion-local route (see
           paged attention (blockwise-causal: causal=False over present blocks)
 ```
 
-Everything inside the dashed "vLLM mainline KV stack" box is **imported and
-reused**. The four boxes outside it (`BDERequestAdapter`, the
-`ChunkWindowSpec`/`ChunkWindowManager` registration, scheduler deltas, runner
-`BlockTables`/`slot_mapping`) are the new code this RFC introduces.
+#### Reuse map — green / yellow / red
+
+<a id="reuse-map--green--yellow--red"></a>
+Three categories describe every box in the stack. Use this map when scoping work
+packages or reviewing PRs: green items should stay import-only; yellow items
+subclass or extend vLLM types; red items are net-new BDE glue.
+
+| Color | Label | Rule |
+| --- | --- | --- |
+| <span style="background:#d4edda;color:#155724;padding:2px 8px;border-radius:4px;font-weight:600">Green — Reused</span> | **Reused as-is** | Imported from vLLM mainline (or already in the BDE engine) and **called without fork or subclass**. Memory policy, refcounting, prefix index, and kernels live here. |
+| <span style="background:#fff3cd;color:#856404;padding:2px 8px;border-radius:4px;font-weight:600">Yellow — Inherited</span> | **Extended / wired** | **Subclasses** a vLLM spec or manager, or **plugs an existing vLLM type** into a new diffusion call path (config extension, `spec_manager_map` registration, runner wiring). |
+| <span style="background:#f8d7da;color:#721c24;padding:2px 8px;border-radius:4px;font-weight:600">Red — New</span> | **Net-new BDE** | No vLLM superclass — new modules, scheduler hooks, or attention backends that make the library call possible. |
+
+| Layer | Component | Color | Rationale |
+| --- | --- | --- | --- |
+| **Config** | `DiffusionKVCacheConfig` + `OmniDiffusionConfig.kv_cache_config` field | Yellow | Extends existing `OmniDiffusionConfig`; new dataclass, existing config plumbing. |
+| **Engine (unchanged)** | `DiffusionScheduler`, `DiffusionWorker`, `DiffusionModelRunner` | Green | Existing BDE execution path; **not** embedded in vLLM's LLM scheduler/runner. |
+| **Engine (unchanged)** | `DiffusionRequestState` / `OmniDiffusionRequest` | Green | Existing request objects; adapter reads them, does not replace them. |
+| **Compatibility** | `BDERequestAdapter` | Red | Duck-types the subset of `vllm Request` that `KVCacheManager` reads; no vLLM base class. |
+| **Compatibility** | Scheduler admission deltas (`num_new_tokens`, preempt/finish `free()`) | Red | New bookkeeping hooks in `sched/*.py`; vLLM scheduler is not reused. |
+| **Compatibility** | Runner `slot_mapping` builder + per-chunk table refresh | Red | New glue in `diffusion_model_runner`; turns block ids into kernel indices each chunk. |
+| **Compatibility** | Paged diffusion attention backend (`causal=False`, blockwise-causal) | Red | New backend module wrapping reused paged kernels; today's `AttentionImpl` has no `block_table` arg. |
+| **vLLM KV manager** | `KVCacheManager.allocate_slots()` / `free()` / `get_computed_blocks()` | Green | Called as a **library** through the adapter; unmodified. |
+| **vLLM KV manager** | `BlockPool` (free queue, `ref_cnt`, `null_block`, prefix index) | Green | Shared pool; BDE does not fork allocator or refcount model. |
+| **vLLM KV manager** | Prefix-cache hash lookup + shared-block `ref_cnt` (Phase 3) | Green | Reuses vLLM prefix index; BDE only supplies `block_hashes` via adapter. |
+| **vLLM KV manager** | `ChunkWindowSpec` | Yellow | Subclass of `SlidingWindowSpec`; adds `chunk_size`, `window_chunks`, `sink_chunks`, `reset_at_boundary`. |
+| **vLLM KV manager** | `ChunkWindowManager` | Yellow | Subclass of `SlidingWindowManager`; overrides `get_num_skipped_tokens` for chunk-boundary eviction. |
+| **vLLM KV manager** | `spec_manager_map[ChunkWindowSpec] = ChunkWindowManager` | Yellow | Uses vLLM's existing registration hook; new key/value pair only. |
+| **vLLM worker** | `BlockTables` (`vllm/v1/worker/gpu/block_table.py`) | Yellow | vLLM class; **new** diffusion-side ownership and rebuild cadence (each chunk). |
+| **vLLM kernels** | Paged attention / FlashAttention paged write path | Green | Kernel code reused; semantics (`causal=False`, present-block mask) owned by red backend. |
+| **Orthogonal** | Feature/step caches (TeaCache, MagCache, cache-dit) | Green | Unchanged; composable with KV manager, not replaced by it. |
+| **Future** | `AttentionSegment` + per-modality `KVCacheGroup` (OmniForcing) | Yellow / Red | Segments are a new logical dataclass (red); map onto existing `KVCacheGroupSpec` (green/yellow). Cross-group composed block table for A2V/V2A is red. |
+
+```mermaid
+flowchart TB
+    subgraph legend[" "]
+        direction LR
+        L1["Green — Reused as-is"]
+        L2["Yellow — Inherited / wired"]
+        L3["Red — Net-new BDE"]
+    end
+
+    CFG["DiffusionKVCacheConfig"]:::inherited
+    SCH["DiffusionScheduler"]:::reused
+    WRK["DiffusionWorker"]:::reused
+    RUN["DiffusionModelRunner"]:::reused
+    ADP["BDERequestAdapter"]:::new
+    DEL["Scheduler admission deltas"]:::new
+    KM["KVCacheManager"]:::reused
+    BP["BlockPool + prefix index"]:::reused
+    CWS["ChunkWindowSpec"]:::inherited
+    CWM["ChunkWindowManager"]:::inherited
+    BT["BlockTables wiring"]:::inherited
+    SM["slot_mapping builder"]:::new
+    PA["Paged diffusion backend"]:::new
+    KERN["Paged attention kernels"]:::reused
+
+    CFG --> SCH
+    CFG --> RUN
+    SCH --> DEL
+    DEL --> ADP
+    WRK --> ADP
+    ADP --> KM
+    KM --> BP
+    KM --> CWM
+    CWS --> CWM
+    KM --> BT
+    BT --> SM
+    SM --> PA
+    PA --> KERN
+    RUN --> SM
+
+    classDef reused fill:#d4edda,stroke:#28a745,color:#155724
+    classDef inherited fill:#fff3cd,stroke:#ffc107,color:#856404
+    classDef new fill:#f8d7da,stroke:#dc3545,color:#721c24
+    class L1 reused
+    class L2 inherited
+    class L3 new
+    class CFG,CWS,CWM,BT inherited
+    class ADP,DEL,SM,PA new
+    class SCH,WRK,RUN,KM,BP,KERN reused
+```
+
+Everything inside the dashed "vLLM mainline KV stack" box in the ASCII diagram
+is **green or yellow** (import + subclass). The four outward-facing glue pieces
+(`BDERequestAdapter`, scheduler deltas, runner `BlockTables`/`slot_mapping`
+wiring, paged backend) are **red**. The manager/pool/kernel core stays green so
+B1/B2 benefits (prefix sharing, admission gate) are not lost — see
+[Alternative 7](#alternatives-considered).
 
 ### Component 1: BDERequestAdapter
 

@@ -31,6 +31,7 @@
 - [术语](#terminology)
 - [设计方案](#proposed-design)
   - [架构概览](#architecture-overview)
+    - [复用地图 — 绿 / 黄 / 红](#reuse-map--green--yellow--red)
   - [组件 1：BDERequestAdapter](#component-1-bderequestadapter)
   - [组件 2：ChunkWindowSpec / ChunkWindowManager](#component-2-chunkwindowspec--chunkwindowmanager)
   - [组件 3：Scheduler admission deltas](#component-3-scheduler-admission-deltas)
@@ -300,7 +301,88 @@ New compatibility layers (the deliverables of this RFC):
           paged attention (blockwise-causal: causal=False over present blocks)
 ```
 
-虚线框 “vLLM mainline KV stack” 内的所有内容都被**导入并复用**。框外四块（`BDERequestAdapter`、`ChunkWindowSpec`/`ChunkWindowManager` 注册、scheduler deltas、runner `BlockTables`/`slot_mapping`）是本 RFC 引入的新代码。
+#### 复用地图 — 绿 / 黄 / 红
+
+<a id="reuse-map--green--yellow--red"></a>
+三类颜色标注栈中每个组件的来源与改动范围。划分 WP 或 review PR 时：绿色应保持纯 import；黄色为 subclass 或接线；红色为本 RFC 交付的全新 BDE glue。
+
+| 颜色 | 标签 | 规则 |
+| --- | --- | --- |
+| <span style="background:#d4edda;color:#155724;padding:2px 8px;border-radius:4px;font-weight:600">绿色 — 复用</span> | **原样复用** | 从 vLLM 主线（或 BDE 已有代码）**直接 import 并调用**，不 fork、不 subclass、不重实现。内存策略、refcount、prefix index、kernel 在此。 |
+| <span style="background:#fff3cd;color:#856404;padding:2px 8px;border-radius:4px;font-weight:600">黄色 — 继承</span> | **扩展 / 接线** | **继承** vLLM spec/manager，或将已有 vLLM 类型**接入** diffusion 新调用路径（config 扩展、`spec_manager_map` 注册、runner 接线）。 |
+| <span style="background:#f8d7da;color:#721c24;padding:2px 8px;border-radius:4px;font-weight:600">红色 — 全新</span> | **BDE 新增** | 无 vLLM 基类 — 新模块、scheduler hook 或 attention backend，使库级调用成为可能。 |
+
+| 层级 | 组件 | 颜色 | 理由 |
+| --- | --- | --- | --- |
+| **Config** | `DiffusionKVCacheConfig` + `OmniDiffusionConfig.kv_cache_config` | 黄 | 扩展已有 `OmniDiffusionConfig`；新 dataclass，复用现有 config plumbing。 |
+| **Engine（不变）** | `DiffusionScheduler`、`DiffusionWorker`、`DiffusionModelRunner` | 绿 | 已有 BDE 执行路径；**未**嵌入 vLLM LLM scheduler/runner。 |
+| **Engine（不变）** | `DiffusionRequestState` / `OmniDiffusionRequest` | 绿 | 已有 request 对象；adapter 读取它们，不替换它们。 |
+| **兼容层** | `BDERequestAdapter` | 红 | Duck-type `KVCacheManager` 读取的 `vllm Request` 子集；无 vLLM 基类。 |
+| **兼容层** | Scheduler admission deltas（`num_new_tokens`、preempt/finish `free()`） | 红 | `sched/*.py` 中新 bookkeeping hook；不复用 vLLM scheduler。 |
+| **兼容层** | Runner `slot_mapping` builder + 每 chunk table 刷新 | 红 | `diffusion_model_runner` 中新 glue；将 block id 转为 kernel 索引。 |
+| **兼容层** | Paged diffusion attention backend（`causal=False`、blockwise-causal） | 红 | 包装复用 kernel 的新 backend；现有 `AttentionImpl` 无 `block_table` 参数。 |
+| **vLLM KV manager** | `KVCacheManager.allocate_slots()` / `free()` / `get_computed_blocks()` | 绿 | 经 adapter 以**库**方式调用；未修改。 |
+| **vLLM KV manager** | `BlockPool`（free queue、`ref_cnt`、`null_block`、prefix index） | 绿 | 共享 pool；BDE 不 fork allocator 或 refcount 模型。 |
+| **vLLM KV manager** | Prefix-cache hash lookup + 共享 block `ref_cnt`（Phase 3） | 绿 | 复用 vLLM prefix index；BDE 仅经 adapter 提供 `block_hashes`。 |
+| **vLLM KV manager** | `ChunkWindowSpec` | 黄 | `SlidingWindowSpec` 子类；新增 `chunk_size`、`window_chunks`、`sink_chunks`、`reset_at_boundary`。 |
+| **vLLM KV manager** | `ChunkWindowManager` | 黄 | `SlidingWindowManager` 子类；override `get_num_skipped_tokens` 实现 chunk 边界驱逐。 |
+| **vLLM KV manager** | `spec_manager_map[ChunkWindowSpec] = ChunkWindowManager` | 黄 | 使用 vLLM 已有注册 hook；仅新增 key/value。 |
+| **vLLM worker** | `BlockTables`（`vllm/v1/worker/gpu/block_table.py`） | 黄 | vLLM 类；diffusion 侧**新** ownership 与重建节奏（每 chunk）。 |
+| **vLLM kernels** | Paged attention / FlashAttention paged write path | 绿 | Kernel 代码复用；语义（`causal=False`、present-block mask）由红色 backend 负责。 |
+| **正交** | Feature/step caches（TeaCache、MagCache、cache-dit） | 绿 | 不变；与 KV manager 可组合，不被其替换。 |
+| **Future** | `AttentionSegment` + 每模态 `KVCacheGroup`（OmniForcing） | 黄 / 红 | Segment 为新逻辑 dataclass（红）；映射到已有 `KVCacheGroupSpec`（绿/黄）。A2V/V2A cross-group composed block table 为红。 |
+
+```mermaid
+flowchart TB
+    subgraph legend[" "]
+        direction LR
+        L1["Green — Reused as-is"]
+        L2["Yellow — Inherited / wired"]
+        L3["Red — Net-new BDE"]
+    end
+
+    CFG["DiffusionKVCacheConfig"]:::inherited
+    SCH["DiffusionScheduler"]:::reused
+    WRK["DiffusionWorker"]:::reused
+    RUN["DiffusionModelRunner"]:::reused
+    ADP["BDERequestAdapter"]:::new
+    DEL["Scheduler admission deltas"]:::new
+    KM["KVCacheManager"]:::reused
+    BP["BlockPool + prefix index"]:::reused
+    CWS["ChunkWindowSpec"]:::inherited
+    CWM["ChunkWindowManager"]:::inherited
+    BT["BlockTables wiring"]:::inherited
+    SM["slot_mapping builder"]:::new
+    PA["Paged diffusion backend"]:::new
+    KERN["Paged attention kernels"]:::reused
+
+    CFG --> SCH
+    CFG --> RUN
+    SCH --> DEL
+    DEL --> ADP
+    WRK --> ADP
+    ADP --> KM
+    KM --> BP
+    KM --> CWM
+    CWS --> CWM
+    KM --> BT
+    BT --> SM
+    SM --> PA
+    PA --> KERN
+    RUN --> SM
+
+    classDef reused fill:#d4edda,stroke:#28a745,color:#155724
+    classDef inherited fill:#fff3cd,stroke:#ffc107,color:#856404
+    classDef new fill:#f8d7da,stroke:#dc3545,color:#721c24
+    class L1 reused
+    class L2 inherited
+    class L3 new
+    class CFG,CWS,CWM,BT inherited
+    class ADP,DEL,SM,PA new
+    class SCH,WRK,RUN,KM,BP,KERN reused
+```
+
+ASCII 图中虚线框 “vLLM mainline KV stack” 内均为**绿或黄**（import + subclass）。朝外的四块 glue（`BDERequestAdapter`、scheduler deltas、runner `BlockTables`/`slot_mapping` 接线、paged backend）为**红**。manager/pool/kernel 核心保持绿色，以免丢失 B1/B2 收益（prefix 共享、admission gate）——见[替代方案 7](#alternatives-considered)。
 
 <a id="component-1-bderequestadapter"></a>
 ### 组件 1：BDERequestAdapter
